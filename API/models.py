@@ -747,3 +747,70 @@ class TeachingSubject(models.Model):
     
     def __str__(self):
         return f"{self.subject_name} ({self.get_teaching_level_display()})"
+
+
+# ==================== APPLICATION WINDOW MODEL ====================
+class ApplicationWindow(models.Model):
+    """Model to manage application intake periods/windows"""
+    academic_year = models.CharField(
+        max_length=9, 
+        help_text="e.g., 2024, 2024/2025"
+    )
+    intake_period = models.CharField(
+        max_length=50, 
+        help_text="e.g., September Intake, January Intake"
+    )
+    start_date = models.DateTimeField()
+    end_date = models.DateTimeField()
+    is_open = models.BooleanField(default=True)
+    programmes_offered = models.JSONField(
+        default=list, 
+        help_text="List of programme names offered"
+    )
+    max_applications = models.IntegerField(
+        default=1000, 
+        help_text="Maximum number of applications to accept"
+    )
+    current_applications = models.IntegerField(
+        default=0, 
+        help_text="Current number of applications received"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.CharField(
+        max_length=255, 
+        blank=True, 
+        help_text="User who created this window"
+    )
+    
+    def __str__(self):
+        return f"{self.intake_period} {self.academic_year} ({'Open' if self.is_open else 'Closed'})"
+    
+    def get_days_remaining(self):
+        """Get number of days remaining until window closes"""
+        if self.is_open and self.end_date:
+            delta = self.end_date - timezone.now()
+            return max(0, delta.days)
+        return 0
+    
+    def get_fill_rate(self):
+        """Get percentage of applications received vs max capacity"""
+        if self.max_applications > 0:
+            return (self.current_applications / self.max_applications) * 100
+        return 0
+    
+    def is_accepting_applications(self):
+        """Check if window is currently accepting applications"""
+        now = timezone.now()
+        return self.is_open and self.start_date <= now <= self.end_date
+    
+    class Meta:
+        db_table = 'application_windows'
+        ordering = ['-academic_year', '-created_at']
+        verbose_name = "Application Window"
+        verbose_name_plural = "Application Windows"
+        indexes = [
+            models.Index(fields=['is_open', 'start_date', 'end_date']),
+            models.Index(fields=['academic_year']),
+            models.Index(fields=['intake_period']),
+        ]
