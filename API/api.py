@@ -6,12 +6,32 @@ from django.contrib.auth import authenticate
 from django.conf import settings
 import jwt
 from datetime import datetime, timedelta, timezone
-from .models import Applicant, NextOfKin
+from .models import Applicant, NextOfKin, SubjectRecord
 
 api = NinjaAPI()
 router = Router()
 
 # ==================== SCHEMAS ====================
+
+class SubjectRecordSchema(Schema):
+    qualification: str
+    centre_number: str
+    exam_number: str
+    subject: str
+    grade: str
+    year: str
+
+class SubjectRecordResponse(Schema):
+    id: int
+    qualification: str
+    centre_number: str
+    exam_number: str
+    subject: str
+    grade: str
+    year: str
+    created_at: Optional[str] = None
+
+
 
 class ApplicantRegistrationSchema(Schema):
     title: str
@@ -639,6 +659,173 @@ def get_csrf_token(request):
         "message": "CSRF token not required for JWT authentication",
         "csrfToken": "not-required-for-jwt"
     }
+
+
+
+
+
+
+
+    # ==================== SUBJECT RECORDS ENDPOINTS ====================
+
+@router.get("/subject-records", response={200: dict, 401: dict})
+@router.get("/subject-records/", response={200: dict, 401: dict})
+def get_subject_records(request):
+    """Get all subject records for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        records = SubjectRecord.objects.filter(user=user).order_by('-year', 'subject')
+        
+        data = []
+        for record in records:
+            data.append({
+                "id": record.id,
+                "qualification": record.qualification,
+                "centre_number": record.centre_number,
+                "exam_number": record.exam_number,
+                "subject": record.subject,
+                "grade": record.grade,
+                "year": record.year,
+                "created_at": record.created_at.isoformat() if record.created_at else None
+            })
+        
+        return {
+            "success": True,
+            "message": "Subject records retrieved successfully",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching subject records: {str(e)}")
+        return {
+            "success": True,
+            "message": "No subject records found",
+            "data": [],
+            "count": 0
+        }
+
+@router.post("/subject-records", response={200: dict, 401: dict})
+@router.post("/subject-records/", response={200: dict, 401: dict})
+def create_subject_record(request, data: SubjectRecordSchema):
+    """Create a new subject record"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Validate year
+        current_year = datetime.now().year
+        year = int(data.year)
+        if year < 1950 or year > current_year + 1:
+            raise HttpError(400, f"Year must be between 1950 and {current_year + 1}")
+        
+        record = SubjectRecord.objects.create(
+            user=user,
+            qualification=data.qualification,
+            centre_number=data.centre_number,
+            exam_number=data.exam_number,
+            subject=data.subject,
+            grade=data.grade,
+            year=data.year
+        )
+        
+        return {
+            "success": True,
+            "message": "Subject record created successfully",
+            "data": {
+                "id": record.id,
+                "qualification": record.qualification,
+                "centre_number": record.centre_number,
+                "exam_number": record.exam_number,
+                "subject": record.subject,
+                "grade": record.grade,
+                "year": record.year
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating subject record: {str(e)}")
+        raise HttpError(500, f"Failed to create subject record: {str(e)}")
+
+@router.put("/subject-records/{record_id}", response={200: dict, 401: dict, 404: dict})
+@router.put("/subject-records/{record_id}/", response={200: dict, 401: dict, 404: dict})
+def update_subject_record(request, record_id: int, data: SubjectRecordSchema):
+    """Update an existing subject record"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            record = SubjectRecord.objects.get(id=record_id, user=user)
+        except SubjectRecord.DoesNotExist:
+            raise HttpError(404, "Subject record not found")
+        
+        # Validate year
+        current_year = datetime.now().year
+        year = int(data.year)
+        if year < 1950 or year > current_year + 1:
+            raise HttpError(400, f"Year must be between 1950 and {current_year + 1}")
+        
+        record.qualification = data.qualification
+        record.centre_number = data.centre_number
+        record.exam_number = data.exam_number
+        record.subject = data.subject
+        record.grade = data.grade
+        record.year = data.year
+        record.save()
+        
+        return {
+            "success": True,
+            "message": "Subject record updated successfully",
+            "data": {
+                "id": record.id,
+                "qualification": record.qualification,
+                "centre_number": record.centre_number,
+                "exam_number": record.exam_number,
+                "subject": record.subject,
+                "grade": record.grade,
+                "year": record.year
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating subject record: {str(e)}")
+        raise HttpError(500, f"Failed to update subject record: {str(e)}")
+
+@router.delete("/subject-records/{record_id}", response={200: dict, 401: dict, 404: dict})
+@router.delete("/subject-records/{record_id}/", response={200: dict, 401: dict, 404: dict})
+def delete_subject_record(request, record_id: int):
+    """Delete a subject record"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            record = SubjectRecord.objects.get(id=record_id, user=user)
+        except SubjectRecord.DoesNotExist:
+            raise HttpError(404, "Subject record not found")
+        
+        record.delete()
+        
+        return {
+            "success": True,
+            "message": "Subject record deleted successfully",
+            "data": None
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting subject record: {str(e)}")
+        raise HttpError(500, f"Failed to delete subject record: {str(e)}")
+
+
+
+
+
 
 # Add router to API
 api.add_router("/", router)

@@ -197,3 +197,31 @@ class FeePayment(models.Model):
     class Meta:
         db_table = 'fee_payments'
         ordering = ['-payment_date']
+
+# Subject Record model for high school academic records
+class SubjectRecord(models.Model):
+    QUALIFICATION_CHOICES = [
+        ('MSCE (Malawi School Certificate of Education)', 'MSCE (Malawi School Certificate of Education)'),
+        ('JCE (Junior Certificate of Education)', 'JCE (Junior Certificate of Education)'),
+        ('O-Level', 'O-Level'),
+        ('A-Level', 'A-Level'),
+        ('IGCSE', 'IGCSE'),
+        ('Other', 'Other'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='subject_records')
+    qualification = models.CharField(max_length=100, choices=QUALIFICATION_CHOICES)
+    centre_number = models.CharField(max_length=50)
+    exam_number = models.CharField(max_length=50)
+    subject = models.CharField(max_length=100)
+    grade = models.CharField(max_length=10)
+    year = models.CharField(max_length=4)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"{self.subject} - {self.grade} ({self.year})"
+    
+    class Meta:
+        db_table = 'subject_records'
+        ordering = ['-year', 'subject']
