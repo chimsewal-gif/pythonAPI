@@ -28,13 +28,16 @@ class LoginSchema(Schema):
     email_or_username: str
     password: str
 
+class UpdateRoleSchema(Schema):
+    role: str
+
 class PersonalDetailsSchema(Schema):
     first_name: str
+    middle_name: Optional[str] = None
     last_name: str
     email: str
     phone: Optional[str] = None
     date_of_birth: Optional[str] = None
-    address: Optional[str] = None
     gender: Optional[str] = None
     nationality: Optional[str] = None
     national_id: Optional[str] = None
@@ -102,25 +105,19 @@ def login_user(request, data: LoginSchema):
     try:
         print(f"📝 Login attempt for: {data.email_or_username}")
         
-        # Find user
         if '@' in data.email_or_username:
             try:
                 user = User.objects.get(email=data.email_or_username)
             except User.DoesNotExist:
-                print(f"❌ No user with email: {data.email_or_username}")
                 raise HttpError(401, "Invalid credentials")
         else:
             try:
                 user = User.objects.get(username=data.email_or_username)
             except User.DoesNotExist:
-                print(f"❌ No user with username: {data.email_or_username}")
                 raise HttpError(401, "Invalid credentials")
         
-        # Authenticate
         if user.check_password(data.password):
             token = create_jwt_token(user)
-            
-            print(f"✅ Login successful for: {user.username}")
             
             try:
                 applicant = Applicant.objects.get(user=user)
@@ -142,13 +139,12 @@ def login_user(request, data: LoginSchema):
                 "token": token
             }
         else:
-            print(f"❌ Authentication failed for: {user.username}")
             raise HttpError(401, "Invalid credentials")
             
     except HttpError:
         raise
     except Exception as e:
-        print(f"💥 Login error: {str(e)}")
+        print(f"Login error: {str(e)}")
         raise HttpError(500, f"Login failed: {str(e)}")
 
 @router.post("/register", response={201: AuthResponseSchema, 400: dict})
@@ -234,47 +230,151 @@ def get_current_user(request):
 def logout_user(request):
     return {"success": True, "message": "Logged out successfully"}
 
-# ==================== PERSONAL DETAILS ENDPOINTS ====================
+@router.post("/update-role", response={200: AuthResponseSchema, 400: dict, 401: dict})
+@router.post("/update-role/", response={200: AuthResponseSchema, 400: dict, 401: dict})
+def update_user_role(request, data: UpdateRoleSchema):
+    try:
+        user = get_user_from_token(request)
+        role = data.role
+        
+        valid_roles = ['odl', 'postgraduate', 'diploma', 'international', 'weekend', 'masters']
+        if role not in valid_roles:
+            return {
+                "success": False,
+                "message": f"Invalid role. Must be one of: {', '.join(valid_roles)}",
+                "user": None
+            }
+        
+        try:
+            applicant = Applicant.objects.get(user=user)
+            applicant.program = role
+            applicant.save()
+        except Applicant.DoesNotExist:
+            Applicant.objects.create(
+                user=user,
+                first_name=user.first_name,
+                last_name=user.last_name,
+                email=user.email,
+                program=role
+            )
+        
+        return {
+            "success": True,
+            "message": f"Application type updated to {role} successfully",
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "role": role
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating role: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error updating role: {str(e)}",
+            "user": None
+        }
 
+# ==================== PERSONAL DETAILS ENDPOINTS ====================
 @router.post("/personal-details", response={200: dict, 401: dict})
 @router.post("/personal-details/", response={200: dict, 401: dict})
 def save_personal_details(request, data: PersonalDetailsSchema):
     try:
-        user = get_user_from_token(request)
+        print("=" * 50)
+        print("SAVING PERSONAL DETAILS")
+        print(f"Received data: {data.dict()}")
         
+        user = get_user_from_token(request)
+        print(f"User: {user.username} (ID: {user.id})")
+        
+        # Update User model
         user.first_name = data.first_name
         user.last_name = data.last_name
         user.email = data.email
         user.save()
+        print("User model updated")
         
+        # Get or create Applicant profile
         applicant, created = Applicant.objects.get_or_create(user=user)
+        print(f"Applicant {'created' if created else 'retrieved'}")
+        
+        # Update applicant fields
         applicant.first_name = data.first_name
+        applicant.middle_name = data.middle_name or ""
         applicant.last_name = data.last_name
         applicant.email = data.email
         applicant.phone = data.phone or ""
-        applicant.date_of_birth = data.date_of_birth if data.date_of_birth else None
-        applicant.gender = data.gender or ""
-        applicant.nationality = data.nationality or ""
-        applicant.national_id = data.national_id or ""
-        applicant.home_district = data.home_district or ""
-        applicant.physical_address = data.physical_address or data.address or ""
+        
+        # Convert gender from string to model choice
+        gender_mapping = {
+            'Male': 'M',
+            'Female': 'F',
+            'Other': 'O',
+            'male': 'M',
+            'female': 'F',
+            'other': 'O'
+        }
+        
+        if data.gender:
+            applicant.gender = gender_mapping.get(data.gender, 'O')
+        
+        # Handle date of birth
+        if data.date_of_birth:
+            applicant.date_of_birth = data.date_of_birth
+        
+        # Update other fields
+        if data.nationality:
+            applicant.nationality = data.nationality
+        if data.national_id:
+            applicant.national_id = data.national_id
+        if data.home_district:
+            applicant.home_district = data.home_district
+        if data.physical_address:
+            applicant.physical_address = data.physical_address
+        
         applicant.save()
+        print("Applicant profile updated")
+        
+        # Return success response with converted gender back for frontend
+        gender_reverse = {v: k for k, v in gender_mapping.items()}
         
         return {
             "success": True,
             "message": "Personal details saved successfully",
             "data": {
+                "id": applicant.id,
                 "first_name": applicant.first_name,
+                "middle_name": applicant.middle_name,
                 "last_name": applicant.last_name,
                 "email": applicant.email,
-                "phone": applicant.phone
+                "phone": applicant.phone,
+                "gender": gender_reverse.get(applicant.gender, 'Other'),
+                "date_of_birth": applicant.date_of_birth,
+                "nationality": applicant.nationality,
+                "national_id": applicant.national_id,
+                "home_district": applicant.home_district,
+                "physical_address": applicant.physical_address
             }
         }
+        
     except HttpError:
         raise
     except Exception as e:
-        print(f"Error saving personal details: {str(e)}")
-        raise HttpError(500, f"Failed to save: {str(e)}")
+        print(f"ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }, 500
+
+
 
 @router.get("/personal-details", response={200: dict, 401: dict})
 @router.get("/personal-details/", response={200: dict, 401: dict})
@@ -282,15 +382,23 @@ def get_personal_details(request):
     try:
         user = get_user_from_token(request)
         
+        gender_mapping = {
+            'M': 'Male',
+            'F': 'Female',
+            'O': 'Other',
+            '': ''
+        }
+        
         try:
             applicant = Applicant.objects.get(user=user)
             data = {
                 "first_name": applicant.first_name,
+                "middle_name": applicant.middle_name,
                 "last_name": applicant.last_name,
                 "email": applicant.email,
                 "phone": applicant.phone,
+                "gender": gender_mapping.get(applicant.gender, ''),
                 "date_of_birth": applicant.date_of_birth,
-                "gender": applicant.gender,
                 "nationality": applicant.nationality,
                 "national_id": applicant.national_id,
                 "home_district": applicant.home_district,
@@ -299,11 +407,12 @@ def get_personal_details(request):
         except Applicant.DoesNotExist:
             data = {
                 "first_name": user.first_name,
+                "middle_name": "",
                 "last_name": user.last_name,
                 "email": user.email,
                 "phone": "",
-                "date_of_birth": None,
                 "gender": "",
+                "date_of_birth": None,
                 "nationality": "",
                 "national_id": "",
                 "home_district": "",
@@ -315,11 +424,21 @@ def get_personal_details(request):
             "message": "Personal details retrieved successfully",
             "data": data
         }
+        
     except HttpError:
         raise
     except Exception as e:
-        print(f"Error fetching personal details: {str(e)}")
-        raise HttpError(500, f"Failed to fetch: {str(e)}")
+        print(f"Error: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }, 500
+
+
+
+
+
+
 
 # ==================== NEXT OF KIN ENDPOINTS ====================
 
@@ -391,7 +510,6 @@ def get_next_of_kin(request):
     except HttpError:
         raise
     except Exception as e:
-        print(f"Error fetching next of kin: {str(e)}")
         return {
             "success": True,
             "message": "No next of kin details found",
@@ -472,6 +590,54 @@ def test_endpoint(request):
         "status": "success",
         "message": "API is working!",
         "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+
+    # Add this with your other schemas (around line 50)
+class VerifyTokenResponse(Schema):
+    success: bool
+    message: str
+    user: Optional[dict] = None
+
+# Add these endpoints after your test endpoint (around line 500)
+
+@router.get("/verify-token", response={200: dict, 401: dict})
+@router.get("/verify-token/", response={200: dict, 401: dict})
+def verify_token(request):
+    """Verify if the JWT token is valid"""
+    try:
+        user = get_user_from_token(request)
+        return {
+            "success": True,
+            "message": "Token is valid",
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "username": user.username
+            }
+        }
+    except HttpError:
+        return {
+            "success": False,
+            "message": "Invalid or expired token"
+        }, 401
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }, 401
+
+@router.get("/csrf", response={200: dict})
+@router.get("/csrf/", response={200: dict})
+def get_csrf_token(request):
+    """Return CSRF token (simplified for JWT auth)"""
+    return {
+        "success": True,
+        "message": "CSRF token not required for JWT authentication",
+        "csrfToken": "not-required-for-jwt"
     }
 
 # Add router to API
