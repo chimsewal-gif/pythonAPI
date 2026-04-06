@@ -70,6 +70,23 @@ class Applicant(models.Model):
     application_date = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
+    # ========== PROGRAMME SELECTION FIELDS ==========
+    # This creates an automatic 'selected_programme_id' field
+    selected_programme = models.ForeignKey(
+        'Programme', 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True, 
+        related_name='selected_by_applicants'
+    )
+    # Store additional programme info as backup (without using _id suffix)
+    selected_programme_name = models.CharField(max_length=255, blank=True, null=True)
+    selected_programme_department = models.CharField(max_length=255, blank=True, null=True)
+    selected_programme_duration = models.CharField(max_length=100, blank=True, null=True)
+    selected_programme_category = models.CharField(max_length=100, blank=True, null=True)
+    selected_programme_code = models.CharField(max_length=50, blank=True, null=True)
+    selection_date = models.DateTimeField(auto_now_add=True, null=True)
+    
     def __str__(self):
         return f"{self.first_name} {self.last_name}"
     
@@ -130,7 +147,6 @@ class Programme(models.Model):
     ]
     
     name = models.CharField(max_length=200)
-    # Make it nullable first
     code = models.CharField(max_length=20, unique=True, blank=True, null=True)
     description = models.TextField(blank=True, null=True)
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='programmes')
