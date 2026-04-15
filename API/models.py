@@ -36,6 +36,7 @@ class Applicant(models.Model):
         ('under_review', 'Under Review'),
         ('approved', 'Approved'),
         ('rejected', 'Rejected'),
+        ('submitted', 'Submitted'),
     ]
     
     PROGRAM_CHOICES = [
@@ -71,7 +72,7 @@ class Applicant(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     
     # ========== PROGRAMME SELECTION FIELDS ==========
-    # This creates an automatic 'selected_programme_id' field
+    # Django automatically creates 'selected_programme_id' field - DO NOT add it manually
     selected_programme = models.ForeignKey(
         'Programme', 
         on_delete=models.SET_NULL, 
@@ -79,7 +80,7 @@ class Applicant(models.Model):
         blank=True, 
         related_name='selected_by_applicants'
     )
-    # Store additional programme info as backup (without using _id suffix)
+    # Store additional programme info as backup
     selected_programme_name = models.CharField(max_length=255, blank=True, null=True)
     selected_programme_department = models.CharField(max_length=255, blank=True, null=True)
     selected_programme_duration = models.CharField(max_length=100, blank=True, null=True)
@@ -124,7 +125,6 @@ class NextOfKin(models.Model):
     email = models.EmailField(blank=True, null=True)
     address = models.TextField()
     
-    # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -137,7 +137,7 @@ class NextOfKin(models.Model):
         verbose_name_plural = "Next of Kin"
         ordering = ['-created_at']
 
-# Programme model - Keep only one instance
+# Programme model
 class Programme(models.Model):
     CATEGORY_CHOICES = [
         ('undergraduate', 'Undergraduate'),
@@ -188,37 +188,58 @@ class Application(models.Model):
         ordering = ['-created_at']
         unique_together = ['user', 'programme']
 
-# FeePayment model for tracking payments
+# FeeStatus model for tracking payment status (OneToOne with User)
+class FeeStatus(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('accepted', 'Accepted'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+    ]
+    
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='fee_status')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    updated_at = models.DateTimeField(auto_now=True)
+    notes = models.TextField(blank=True, null=True)
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.status}"
+    
+    class Meta:
+        db_table = 'fee_statuses'
+        verbose_name = "Fee Status"
+        verbose_name_plural = "Fee Statuses"
+
+# FeePayment model for tracking deposit slips (OneToOne with User)
 class FeePayment(models.Model):
     STATUS_CHOICES = [
         ('pending', 'Pending'),
-        ('paid', 'Paid'),
-        ('failed', 'Failed'),
-        ('cancelled', 'Cancelled'),
+        ('verified', 'Verified'),
+        ('rejected', 'Rejected'),
+        ('approved', 'Approved'),
     ]
     
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='fee_payments')
-    application = models.ForeignKey(Application, on_delete=models.SET_NULL, null=True, blank=True, related_name='payments')
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
-    currency = models.CharField(max_length=3, default='MWK')
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='fee_payment')
+    deposit_slip_path = models.CharField(max_length=500)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
-    reference = models.CharField(max_length=100, unique=True)
-    payment_date = models.DateTimeField(auto_now_add=True)
-    description = models.TextField(blank=True, null=True)
-    transaction_id = models.CharField(max_length=100, blank=True, null=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2, default=25000)
+    notes = models.TextField(blank=True, null=True)
     
     def __str__(self):
-        return f"Payment {self.reference} - {self.amount} {self.currency}"
+        return f"{self.user.username} - {self.status} - {self.amount} MWK"
     
     class Meta:
         db_table = 'fee_payments'
-        ordering = ['-payment_date']
+        ordering = ['-uploaded_at']
 
 # Subject Record model for high school academic records
 class SubjectRecord(models.Model):
     QUALIFICATION_CHOICES = [
-        ('MSCE (Malawi School Certificate of Education)', 'MSCE (Malawi School Certificate of Education)'),
-        ('JCE (Junior Certificate of Education)', 'JCE (Junior Certificate of Education)'),
+        ('MSCE', 'MSCE (Malawi School Certificate of Education)'),
+        ('JCE', 'JCE (Junior Certificate of Education)'),
         ('O-Level', 'O-Level'),
         ('A-Level', 'A-Level'),
         ('IGCSE', 'IGCSE'),

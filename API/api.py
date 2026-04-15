@@ -6,11 +6,16 @@ from django.contrib.auth import authenticate
 from django.conf import settings
 import jwt
 import os
+import json
+from django.core.mail import send_mail
+from django.template.loader import render_to_string
+from django.utils.html import strip_tags
+
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 
 from datetime import datetime, timedelta, timezone
-from .models import Applicant, NextOfKin, SubjectRecord, Department, Programme, Application
+from .models import Applicant, NextOfKin, SubjectRecord, Department, Programme, Application, FeePayment, FeeStatus
 
 api = NinjaAPI()
 router = Router()
@@ -216,8 +221,9 @@ def login_user(request, data: LoginSchema):
         print(f"Login error: {str(e)}")
         raise HttpError(500, f"Login failed: {str(e)}")
 
-@router.post("/register", response={201: AuthResponseSchema, 400: dict})
-@router.post("/register/", response={201: AuthResponseSchema, 400: dict})
+        
+@router.post("/register", response={201: AuthResponseSchema, 200: AuthResponseSchema, 400: dict})
+@router.post("/register/", response={201: AuthResponseSchema, 200: AuthResponseSchema, 400: dict})
 def register_applicant(request, data: ApplicantRegistrationSchema):
     try:
         print(f"Registration attempt for: {data.email}")
@@ -247,7 +253,7 @@ def register_applicant(request, data: ApplicantRegistrationSchema):
         
         token = create_jwt_token(user)
         
-        return {
+        return 200, {
             "success": True,
             "message": "Registration successful!",
             "user": {
@@ -265,7 +271,7 @@ def register_applicant(request, data: ApplicantRegistrationSchema):
         raise
     except Exception as e:
         print(f"Registration error: {str(e)}")
-        raise HttpError(400, f"Registration failed: {str(e)}")
+        return {"success": False, "message": f"Registration failed: {str(e)}"}, 400
 
 @router.get("/me", response={200: dict, 401: dict})
 @router.get("/me/", response={200: dict, 401: dict})
@@ -1514,8 +1520,251 @@ def clear_selected_programme(request):
             "message": f"Failed to clear selection: {str(e)}"
         }, 400
 
+# ==================== APPLICANT SUBMISSIONS ENDPOINTS ====================
+
+@router.get("/applicant-submissions", response={200: dict})
+@router.get("/applicant-submissions/", response={200: dict})
+def get_applicant_submissions(request):
+    """Get all applicant submissions for admin"""
+    try:
+        user = get_user_from_token(request)
+        
+        print(f"📋 Fetching applicant submissions for user {user.username}")
+        
+        applicants = Applicant.objects.all().order_by('-application_date')
+        
+        submissions = []
+        for applicant in applicants:
+            user_obj = applicant.user
+            
+            programme_name = applicant.selected_programme_name
+            if not programme_name and applicant.selected_programme:
+                programme_name = applicant.selected_programme.name
+            if not programme_name:
+                programme_name = applicant.program or "Not specified"
+            
+            reference_number = f"APP-{applicant.id:06d}-{applicant.application_date.strftime('%Y') if applicant.application_date else '2024'}"
+            
+            submissions.append({
+                "id": applicant.id,
+                "applicant_name": f"{applicant.first_name} {applicant.last_name}".strip() or user_obj.username,
+                "programme": programme_name,
+                "reference_number": reference_number,
+                "status": applicant.status or "pending",
+                "submitted_at": applicant.application_date.isoformat() if applicant.application_date else user_obj.date_joined.isoformat(),
+                "email": applicant.email or user_obj.email,
+                "phone": applicant.phone or "",
+            })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(submissions)} submissions",
+            "data": submissions,
+            "count": len(submissions)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching submissions: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to fetch submissions: {str(e)}",
+            "data": [],
+            "count": 0
+        }
+
+@router.get("/applicant-submissions/{submission_id}", response={200: dict})
+@router.get("/applicant-submissions/{submission_id}/", response={200: dict})
+def get_applicant_submission(request, submission_id: int):
+    """Get a single applicant submission by ID"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            applicant = Applicant.objects.get(id=submission_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Submission not found"
+            }, 404
+        
+        user_obj = applicant.user
+        
+        programme_name = applicant.selected_programme_name
+        if not programme_name and applicant.selected_programme:
+            programme_name = applicant.selected_programme.name
+        if not programme_name:
+            programme_name = applicant.program or "Not specified"
+        
+        reference_number = f"APP-{applicant.id:06d}-{applicant.application_date.strftime('%Y') if applicant.application_date else '2024'}"
+        
+        next_of_kin_list = []
+        for kin in NextOfKin.objects.filter(user=user_obj):
+            next_of_kin_list.append({
+                "id": kin.id,
+                "title": kin.title,
+                "relationship": kin.relationship,
+                "first_name": kin.first_name,
+                "last_name": kin.last_name,
+                "mobile1": kin.mobile1,
+                "mobile2": kin.mobile2,
+                "email": kin.email,
+                "address": kin.address
+            })
+        
+        subject_records = []
+        for record in SubjectRecord.objects.filter(user=user_obj):
+            subject_records.append({
+                "id": record.id,
+                "qualification": record.qualification,
+                "centre_number": record.centre_number,
+                "exam_number": record.exam_number,
+                "subject": record.subject,
+                "grade": record.grade,
+                "year": record.year
+            })
+        
+        submission_data = {
+            "id": applicant.id,
+            "applicant_name": f"{applicant.first_name} {applicant.last_name}".strip() or user_obj.username,
+            "programme": programme_name,
+            "reference_number": reference_number,
+            "status": applicant.status or "pending",
+            "submitted_at": applicant.application_date.isoformat() if applicant.application_date else user_obj.date_joined.isoformat(),
+            "email": applicant.email or user_obj.email,
+            "phone": applicant.phone or "",
+            "first_name": applicant.first_name,
+            "last_name": applicant.last_name,
+            "middle_name": applicant.middle_name,
+            "date_of_birth": applicant.date_of_birth,
+            "gender": applicant.gender,
+            "nationality": applicant.nationality,
+            "national_id": applicant.national_id,
+            "home_district": applicant.home_district,
+            "physical_address": applicant.physical_address,
+            "next_of_kin": next_of_kin_list,
+            "subject_records": subject_records
+        }
+        
+        return {
+            "success": True,
+            "message": "Submission found",
+            "data": submission_data
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching submission: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@router.patch("/applicant-submissions/{submission_id}/status")
+@router.patch("/applicant-submissions/{submission_id}/status/")
+def update_submission_status(request, submission_id: int):
+    """Update the status of an applicant submission"""
+    try:
+        user = get_user_from_token(request)
+        
+        body = json.loads(request.body)
+        new_status = body.get('status')
+        
+        if not new_status:
+            return {
+                "success": False,
+                "message": "Status is required"
+            }, 400
+        
+        valid_statuses = ['submitted', 'pending', 'under_review', 'reviewed', 'accepted', 'approved', 'rejected']
+        if new_status not in valid_statuses:
+            return {
+                "success": False,
+                "message": f"Invalid status. Must be one of: {valid_statuses}"
+            }, 400
+        
+        try:
+            applicant = Applicant.objects.get(id=submission_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Submission not found"
+            }, 404
+        
+        applicant.status = new_status
+        applicant.save()
+        
+        return {
+            "success": True,
+            "message": f"Status updated to {new_status}",
+            "data": {
+                "id": applicant.id,
+                "status": applicant.status
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error updating status: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }, 400
+
+@router.patch("/applicant-submissions/{submission_id}/ml-prediction")
+@router.patch("/applicant-submissions/{submission_id}/ml-prediction/")
+def update_ml_prediction(request, submission_id: int):
+    """Update ML prediction for an applicant submission"""
+    try:
+        user = get_user_from_token(request)
+        
+        body = json.loads(request.body)
+        ml_prediction = body.get('ml_prediction')
+        last_analyzed_at = body.get('last_analyzed_at')
+        
+        print(f"📊 Received ML prediction for submission {submission_id}")
+        print(f"ML Prediction data: {ml_prediction}")
+        
+        if not ml_prediction:
+            return {
+                "success": False,
+                "message": "ML prediction data is required"
+            }, 400
+        
+        try:
+            applicant = Applicant.objects.get(id=submission_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Submission not found"
+            }, 404
+        
+        print(f"✅ ML Prediction for {applicant.first_name} {applicant.last_name}:")
+        print(f"   Decision: {ml_prediction.get('decision')}")
+        print(f"   Confidence: {ml_prediction.get('confidence')}")
+        
+        return {
+            "success": True,
+            "message": "ML prediction saved successfully",
+            "data": {
+                "id": applicant.id,
+                "ml_prediction": ml_prediction
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error saving ML prediction: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to save ML prediction: {str(e)}"
+        }, 400
+
 # ==================== APPLICANT MANAGEMENT ENDPOINTS ====================
-# These parameterized routes come AFTER the specific programme selection routes
 
 @router.get("/applicants", response={200: dict, 401: dict})
 @router.get("/applicants/", response={200: dict, 401: dict})
@@ -1570,111 +1819,14 @@ def get_applicants(request):
             "count": 0
         }
 
-@router.get("/applicants/{applicant_id}", response={200: dict, 404: dict, 401: dict})
-@router.get("/applicants/{applicant_id}/", response={200: dict, 404: dict, 401: dict})
-def get_applicant(request, applicant_id: int):
-    """Get a single applicant by ID"""
-    try:
-        user = get_user_from_token(request)
-        
-        try:
-            user_obj = User.objects.get(id=applicant_id)
-        except User.DoesNotExist:
-            raise HttpError(404, "Applicant not found")
-        
-        try:
-            applicant = Applicant.objects.get(user=user_obj)
-            data = {
-                "id": user_obj.id,
-                "firstname": applicant.first_name or user_obj.first_name,
-                "lastname": applicant.last_name or user_obj.last_name,
-                "email": user_obj.email,
-                "phone": applicant.phone or "",
-                "program": applicant.program or "Not specified",
-                "status": applicant.status,
-                "application_date": applicant.application_date.isoformat() if applicant.application_date else user_obj.date_joined.isoformat()
-            }
-        except Applicant.DoesNotExist:
-            data = {
-                "id": user_obj.id,
-                "firstname": user_obj.first_name,
-                "lastname": user_obj.last_name,
-                "email": user_obj.email,
-                "phone": "",
-                "program": "Not specified",
-                "status": "user",
-                "application_date": user_obj.date_joined.isoformat() if user_obj.date_joined else None
-            }
-        
-        return {
-            "success": True,
-            "message": "Applicant found",
-            "data": data
-        }
-        
-    except HttpError:
-        raise
-    except Exception as e:
-        print(f"Error fetching applicant: {str(e)}")
-        return {
-            "success": False,
-            "message": str(e)
-        }
-
-@router.put("/applicants/{applicant_id}", response={200: dict, 404: dict, 401: dict})
-@router.put("/applicants/{applicant_id}/", response={200: dict, 404: dict, 401: dict})
-def update_applicant_status(request, applicant_id: int, status: str):
-    """Update applicant status"""
-    try:
-        user = get_user_from_token(request)
-        
-        valid_statuses = ['pending', 'under_review', 'approved', 'rejected']
-        if status not in valid_statuses:
-            raise HttpError(400, f"Invalid status. Must be one of: {valid_statuses}")
-        
-        try:
-            applicant = Applicant.objects.get(user_id=applicant_id)
-            applicant.status = status
-            applicant.save()
-        except Applicant.DoesNotExist:
-            raise HttpError(404, "Applicant profile not found")
-        
-        return {
-            "success": True,
-            "message": f"Applicant {applicant_id} status updated to {status}",
-            "data": {
-                "applicant_id": applicant_id,
-                "status": status
-            }
-        }
-        
-    except HttpError:
-        raise
-    except Exception as e:
-        print(f"Error updating applicant: {str(e)}")
-        return {
-            "success": False,
-            "message": str(e)
-        }
-
-
-
-
-
-
-
-
-
-# ==================== DOCUMENT UPLOAD ENDPOINTS ====================
 # ==================== DOCUMENT UPLOAD ENDPOINTS ====================
 
 import os
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 from django.conf import settings
-from django.http import FileResponse, Http404
+from django.http import FileResponse
 
-# Remove the response models from decorators - let them return directly
 @router.post("/applicants/{applicant_id}/documents")
 @router.post("/applicants/{applicant_id}/documents/")
 def upload_documents(request, applicant_id: int):
@@ -1682,72 +1834,52 @@ def upload_documents(request, applicant_id: int):
     try:
         user = get_user_from_token(request)
         
-        # Verify the applicant exists and belongs to the user
         try:
             applicant = Applicant.objects.get(id=applicant_id, user=user)
         except Applicant.DoesNotExist:
             raise HttpError(404, "Applicant not found")
         
-        # Create documents directory if it doesn't exist
         docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant_id))
         os.makedirs(docs_dir, exist_ok=True)
         
         result = {}
         
-        # Handle MSCE certificate upload
         if 'msce' in request.FILES:
             msce_file = request.FILES['msce']
-            # Validate file size (max 5MB)
             if msce_file.size > 5 * 1024 * 1024:
-                return {
-                    "success": False,
-                    "message": "MSCE certificate file size must be less than 5MB"
-                }, 400
+                return {"success": False, "message": "File size must be less than 5MB"}, 400
             
-            # Generate unique filename
             ext = msce_file.name.split('.')[-1]
             filename = f"msce_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
             filepath = os.path.join('documents', str(applicant_id), filename)
-            
-            # Save file
             saved_path = default_storage.save(filepath, ContentFile(msce_file.read()))
             
             result['msce'] = saved_path
             result['msce_size'] = msce_file.size
             result['msce_name'] = msce_file.name
         
-        # Handle ID card upload
         if 'id_card' in request.FILES:
             id_file = request.FILES['id_card']
             if id_file.size > 5 * 1024 * 1024:
-                return {
-                    "success": False,
-                    "message": "ID card file size must be less than 5MB"
-                }, 400
+                return {"success": False, "message": "File size must be less than 5MB"}, 400
             
             ext = id_file.name.split('.')[-1]
             filename = f"id_card_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
             filepath = os.path.join('documents', str(applicant_id), filename)
-            
             saved_path = default_storage.save(filepath, ContentFile(id_file.read()))
             
             result['id_card'] = saved_path
             result['id_card_size'] = id_file.size
             result['id_card_name'] = id_file.name
         
-        # Handle payment proof upload
         if 'payment_proof' in request.FILES:
             payment_file = request.FILES['payment_proof']
             if payment_file.size > 5 * 1024 * 1024:
-                return {
-                    "success": False,
-                    "message": "Payment proof file size must be less than 5MB"
-                }, 400
+                return {"success": False, "message": "File size must be less than 5MB"}, 400
             
             ext = payment_file.name.split('.')[-1]
             filename = f"payment_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
             filepath = os.path.join('documents', str(applicant_id), filename)
-            
             saved_path = default_storage.save(filepath, ContentFile(payment_file.read()))
             
             result['payment_proof'] = saved_path
@@ -1764,12 +1896,10 @@ def upload_documents(request, applicant_id: int):
         raise
     except Exception as e:
         print(f"Error uploading documents: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return {
-            "success": False,
-            "message": f"Failed to upload documents: {str(e)}"
-        }, 400
+        return {"success": False, "message": f"Failed to upload: {str(e)}"}, 400
+
+
+# Add this GET endpoint after your POST /documents endpoint
 
 @router.get("/applicants/{applicant_id}/documents")
 @router.get("/applicants/{applicant_id}/documents/")
@@ -1778,7 +1908,6 @@ def get_documents(request, applicant_id: int):
     try:
         user = get_user_from_token(request)
         
-        # Verify the applicant exists and belongs to the user
         try:
             applicant = Applicant.objects.get(id=applicant_id, user=user)
         except Applicant.DoesNotExist:
@@ -1787,7 +1916,6 @@ def get_documents(request, applicant_id: int):
                 "message": "Applicant not found"
             }, 404
         
-        # Initialize result with None values
         result = {
             "msce": None,
             "msce_size": None,
@@ -1800,7 +1928,6 @@ def get_documents(request, applicant_id: int):
             "payment_proof_name": None
         }
         
-        # Check for existing documents in the filesystem
         docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant_id))
         if os.path.exists(docs_dir):
             for filename in os.listdir(docs_dir):
@@ -1837,134 +1964,696 @@ def get_documents(request, applicant_id: int):
             "message": f"Failed to get documents: {str(e)}"
         }, 400
 
-@router.get("/applicants/{applicant_id}/documents/{document_type}")
-@router.get("/applicants/{applicant_id}/documents/{document_type}/")
-def download_document(request, applicant_id: int, document_type: str):
-    """Download a specific document"""
-    try:
-        user = get_user_from_token(request)
-        
-        # Verify the applicant exists and belongs to the user
-        try:
-            applicant = Applicant.objects.get(id=applicant_id, user=user)
-        except Applicant.DoesNotExist:
-            return {
-                "success": False,
-                "message": "Applicant not found"
-            }, 404
-        
-        # Validate document type
-        valid_types = ['msce', 'id_card', 'payment_proof']
-        if document_type not in valid_types:
-            return {
-                "success": False,
-                "message": f"Invalid document type. Must be one of: {', '.join(valid_types)}"
-            }, 400
-        
-        # Find the file
-        docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant_id))
-        if not os.path.exists(docs_dir):
-            return {
-                "success": False,
-                "message": "No documents found"
-            }, 404
-        
-        # Find the file matching the document type
-        file_found = None
-        for filename in os.listdir(docs_dir):
-            if filename.startswith(document_type):
-                file_found = filename
-                break
-        
-        if not file_found:
-            return {
-                "success": False,
-                "message": f"{document_type} document not found"
-            }, 404
-        
-        filepath = os.path.join(docs_dir, file_found)
-        
-        # Return file for download
-        try:
-            response = FileResponse(open(filepath, 'rb'), as_attachment=True)
-            response['Content-Disposition'] = f'attachment; filename="{file_found}"'
-            return response
-        except FileNotFoundError:
-            return {
-                "success": False,
-                "message": "File not found"
-            }, 404
-        
-    except HttpError:
-        raise
-    except Exception as e:
-        print(f"Error downloading document: {str(e)}")
-        return {
-            "success": False,
-            "message": f"Failed to download document: {str(e)}"
-        }, 400
+# ==================== DASHBOARD STATS ENDPOINT ====================
 
-@router.delete("/applicants/{applicant_id}/documents/{document_type}")
-@router.delete("/applicants/{applicant_id}/documents/{document_type}/")
-def delete_document(request, applicant_id: int, document_type: str):
-    """Delete a specific document"""
+@router.get("/dashboard/stats", response={200: dict})
+@router.get("/dashboard/stats/", response={200: dict})
+def dashboard_stats(request):
+    """Get dashboard statistics for admin"""
     try:
         user = get_user_from_token(request)
         
-        # Verify the applicant exists and belongs to the user
-        try:
-            applicant = Applicant.objects.get(id=applicant_id, user=user)
-        except Applicant.DoesNotExist:
-            return {
-                "success": False,
-                "message": "Applicant not found"
-            }, 404
+        print(f"📊 Fetching dashboard stats for user {user.username}")
         
-        # Validate document type
-        valid_types = ['msce', 'id_card', 'payment_proof']
-        if document_type not in valid_types:
-            return {
-                "success": False,
-                "message": f"Invalid document type. Must be one of: {', '.join(valid_types)}"
-            }, 400
+        total_applicants = Applicant.objects.count()
         
-        # Find and delete the file
-        docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant_id))
-        if not os.path.exists(docs_dir):
-            return {
-                "success": False,
-                "message": "No documents found"
-            }, 404
+        total_applications = Applicant.objects.exclude(
+            selected_programme__isnull=True
+        ).exclude(
+            selected_programme_name__isnull=True
+        ).count()
         
-        file_found = None
-        for filename in os.listdir(docs_dir):
-            if filename.startswith(document_type):
-                file_found = filename
-                break
+        fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees')
+        total_fees = 0
+        if os.path.exists(fees_dir):
+            for user_dir in os.listdir(fees_dir):
+                user_fees_dir = os.path.join(fees_dir, user_dir)
+                if os.path.isdir(user_fees_dir):
+                    files = os.listdir(user_fees_dir)
+                    if any(f.startswith('deposit_slip_') for f in files):
+                        total_fees += 25000
         
-        if not file_found:
-            return {
-                "success": False,
-                "message": f"{document_type} document not found"
-            }, 404
+        total_programmes = Programme.objects.count()
         
-        filepath = os.path.join(docs_dir, file_found)
-        os.remove(filepath)
+        stats_data = {
+            "totalApplicants": total_applicants,
+            "totalApplications": total_applications,
+            "totalFees": total_fees,
+            "totalProgrammes": total_programmes
+        }
+        
+        print(f"📊 Dashboard stats: {stats_data}")
         
         return {
             "success": True,
-            "message": f"{document_type} document deleted successfully"
+            "message": "Dashboard stats retrieved successfully",
+            "data": stats_data
         }
         
     except HttpError:
         raise
     except Exception as e:
-        print(f"Error deleting document: {str(e)}")
+        print(f"Error fetching dashboard stats: {str(e)}")
         return {
             "success": False,
-            "message": f"Failed to delete document: {str(e)}"
+            "message": f"Failed to fetch dashboard stats: {str(e)}",
+            "data": {
+                "totalApplicants": 0,
+                "totalApplications": 0,
+                "totalFees": 0,
+                "totalProgrammes": 0
+            }
+        }
+
+
+@router.patch("/application-fees/{fee_id}/status")
+@router.patch("/application-fees/{fee_id}/status/")
+def update_fee_status(request, fee_id: int):
+    """Update fee payment status"""
+    try:
+        user = get_user_from_token(request)
+        
+        body = json.loads(request.body)
+        new_status = body.get('status')
+        
+        if not new_status:
+            return {"success": False, "message": "Status is required"}, 400
+        
+        valid_statuses = ['pending', 'accepted', 'rejected', 'approved', 'processing']
+        if new_status not in valid_statuses:
+            return {"success": False, "message": f"Invalid status"}, 400
+        
+        try:
+            user_obj = User.objects.get(id=fee_id)
+        except User.DoesNotExist:
+            return {"success": False, "message": "User not found"}, 404
+        
+        # Update or create fee status
+        fee_status, created = FeeStatus.objects.get_or_create(user=user_obj)
+        fee_status.status = new_status
+        fee_status.save()
+        
+        return {
+            "success": True,
+            "message": f"Fee status updated to {new_status}",
+            "data": {"user_id": fee_id, "status": new_status}
+        }
+        
+    except Exception as e:
+        print(f"Error updating fee status: {str(e)}")
+        return {"success": False, "message": str(e)}, 400
+
+@router.get("/admin/fees", response={200: dict})
+@router.get("/admin/fees/", response={200: dict})
+def get_all_fees(request):
+    """Get all fee submissions for admin"""
+    try:
+        user = get_user_from_token(request)
+        
+        fees_list = []
+        
+        # Get all fee payments from the database
+        from .models import FeePayment
+        
+        fee_payments = FeePayment.objects.select_related('user').all().order_by('-uploaded_at')
+        
+        for fee_payment in fee_payments:
+            user_obj = fee_payment.user
+            
+            # Get applicant name
+            try:
+                applicant = Applicant.objects.get(user=user_obj)
+                applicant_name = f"{applicant.first_name} {applicant.last_name}".strip() or user_obj.username
+                programme = applicant.selected_programme_name or applicant.program or "Not specified"
+            except Applicant.DoesNotExist:
+                applicant_name = user_obj.username
+                programme = "Not specified"
+            
+            # Get fee status (use the status from FeePayment model)
+            status = fee_payment.status
+            
+            # Construct deposit slip URL
+            deposit_slip_url = None
+            if fee_payment.deposit_slip_path:
+                deposit_slip_url = f"/media/{fee_payment.deposit_slip_path}"
+            
+            fees_list.append({
+                "id": fee_payment.id,
+                "user_id": user_obj.id,
+                "applicant_name": applicant_name,
+                "programme": programme,
+                "amount": float(fee_payment.amount),
+                "status": status,
+                "deposit_slip": deposit_slip_url,
+                "paid_at": fee_payment.uploaded_at.isoformat() if fee_payment.uploaded_at else None,
+                "email": user_obj.email,
+            })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(fees_list)} fee submissions",
+            "data": fees_list
+        }
+        
+    except Exception as e:
+        print(f"Error fetching fees: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": str(e),
+            "data": []
+        }, 500
+
+# ==================== APPLICATION FEES SUBMISSION ENDPOINT ====================
+
+@router.post("/application-fees", response={200: dict, 400: dict, 401: dict})
+@router.post("/application-fees/", response={200: dict, 400: dict, 401: dict})
+def submit_application_fees(request):
+    """Handle application fee submission"""
+    try:
+        user = get_user_from_token(request)
+        print(f"📝 Processing application fee for user {user.username}")
+        
+        # Check if deposit slip is provided
+        if 'deposit_slip' not in request.FILES:
+            return {
+                "success": False,
+                "message": "Deposit slip is required"
+            }, 400
+        
+        deposit_slip = request.FILES['deposit_slip']
+        
+        # Validate file type
+        allowed_types = ['image/jpeg', 'image/jpg', 'image/png', 'application/pdf']
+        if deposit_slip.content_type not in allowed_types:
+            return {
+                "success": False,
+                "message": "Invalid file type. Please upload JPG, PNG, or PDF"
+            }, 400
+        
+        # Validate file size (max 5MB)
+        if deposit_slip.size > 5 * 1024 * 1024:
+            return {
+                "success": False,
+                "message": "File size must be less than 5MB"
+            }, 400
+        
+        # Create fees directory if it doesn't exist
+        fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees', str(user.id))
+        os.makedirs(fees_dir, exist_ok=True)
+        
+        # Generate unique filename
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        ext = deposit_slip.name.split('.')[-1]
+        filename = f"deposit_slip_{user.id}_{timestamp}.{ext}"
+        filepath = os.path.join('fees', str(user.id), filename)
+        
+        # Save the file
+        saved_path = default_storage.save(filepath, ContentFile(deposit_slip.read()))
+        
+        # Save to database using FeePayment model
+        try:
+            from .models import FeePayment
+            fee_payment, created = FeePayment.objects.get_or_create(user=user)
+            fee_payment.deposit_slip_path = saved_path
+            fee_payment.status = 'pending'
+            fee_payment.amount = 25000  # MWK 25,000 application fee
+            fee_payment.uploaded_at = datetime.now()
+            fee_payment.save()
+            print(f"✅ Saved to database: {fee_payment}")
+        except Exception as db_error:
+            print(f"⚠️ Database save error: {db_error}")
+            # Continue even if database save fails - file is saved
+        
+        print(f"✅ Deposit slip saved for user {user.username}: {saved_path}")
+        
+        return {
+            "success": True,
+            "message": "Deposit slip submitted successfully! Your application is being processed.",
+            "data": {
+                "file_path": saved_path,
+                "file_name": deposit_slip.name,
+                "file_size": deposit_slip.size,
+                "status": "pending"
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"❌ Error submitting application fees: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to submit deposit slip: {str(e)}"
         }, 400
 
 
+
+@router.get("/application-fees", response={200: dict, 401: dict})
+@router.get("/application-fees/", response={200: dict, 401: dict})
+def get_application_fees(request):
+    """Get application fee status for the current user"""
+    try:
+        user = get_user_from_token(request)
+        print(f"📝 Fetching application fee status for user {user.username}")
+        
+        # Check database first
+        try:
+            from .models import FeePayment
+            fee_payment = FeePayment.objects.get(user=user)
+            return {
+                "success": True,
+                "message": "Application fee found",
+                "data": {
+                    "status": fee_payment.status,
+                    "file_path": fee_payment.deposit_slip_path,
+                    "uploaded_at": fee_payment.uploaded_at.isoformat() if fee_payment.uploaded_at else None,
+                    "amount": float(fee_payment.amount)
+                }
+            }
+        except FeePayment.DoesNotExist:
+            pass
+        
+        # Check filesystem as fallback
+        fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees', str(user.id))
+        
+        if os.path.exists(fees_dir):
+            files = os.listdir(fees_dir)
+            deposit_slips = [f for f in files if f.startswith('deposit_slip_')]
+            
+            if deposit_slips:
+                latest_slip = sorted(deposit_slips)[-1]
+                return {
+                    "success": True,
+                    "message": "Application fee submitted",
+                    "data": {
+                        "status": "pending",
+                        "file_name": latest_slip,
+                        "submitted_date": datetime.fromtimestamp(os.path.getmtime(os.path.join(fees_dir, latest_slip))).isoformat()
+                    }
+                }
+        
+        return {
+            "success": True,
+            "message": "No application fee submitted yet",
+            "data": {
+                "status": "pending"
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching application fees: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to fetch status: {str(e)}"
+        }, 400
+
+# ==================== GET SINGLE APPLICANT ENDPOINT ====================
+
+@router.get("/applicants/{applicant_id}", response={200: dict, 404: dict, 401: dict})
+@router.get("/applicants/{applicant_id}/", response={200: dict, 404: dict, 401: dict})
+def get_single_applicant(request, applicant_id: int):
+    """Get a single applicant by ID"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            user_obj = User.objects.get(id=applicant_id)
+        except User.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"User with ID {applicant_id} not found"
+            }, 404
+        
+        try:
+            applicant = Applicant.objects.get(user=user_obj)
+            data = {
+                "id": user_obj.id,
+                "firstname": applicant.first_name or user_obj.first_name,
+                "lastname": applicant.last_name or user_obj.last_name,
+                "email": user_obj.email,
+                "phone": applicant.phone or "",
+                "program": applicant.program or "Not specified",
+                "status": applicant.status,
+                "physical_address": applicant.physical_address or "",
+                "date_of_birth": applicant.date_of_birth,
+                "gender": applicant.gender,
+                "nationality": applicant.nationality,
+                "national_id": applicant.national_id,
+                "home_district": applicant.home_district,
+                "application_date": applicant.application_date.isoformat() if applicant.application_date else user_obj.date_joined.isoformat()
+            }
+        except Applicant.DoesNotExist:
+            data = {
+                "id": user_obj.id,
+                "firstname": user_obj.first_name,
+                "lastname": user_obj.last_name,
+                "email": user_obj.email,
+                "phone": "",
+                "program": "Not specified",
+                "status": "user",
+                "physical_address": "",
+                "date_of_birth": None,
+                "gender": None,
+                "nationality": "",
+                "national_id": "",
+                "home_district": "",
+                "application_date": user_obj.date_joined.isoformat() if user_obj.date_joined else None
+            }
+        
+        return {
+            "success": True,
+            "message": "Applicant found",
+            "data": data
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching applicant: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }, 400
+
+
+# ==================== SUBMIT APPLICATION ENDPOINT ====================
+
+@router.post("/submit", response={200: dict, 400: dict, 401: dict, 409: dict})
+@router.post("/submit/", response={200: dict, 400: dict, 401: dict, 409: dict})
+def submit_application(request):
+    """Final submission of application"""
+    try:
+        user = get_user_from_token(request)
+        print(f"📝 Finalizing application for user {user.username}")
+        
+        # Parse request body
+        import json
+        body = json.loads(request.body) if request.body else {}
+        programme_id = body.get('programme_id')
+        
+        if not programme_id:
+            return {
+                "success": False,
+                "message": "Programme ID is required"
+            }, 400
+        
+        try:
+            applicant = Applicant.objects.get(user=user)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Applicant profile not found. Please complete your profile first."
+            }, 404
+        
+        # Check if already submitted
+        if applicant.status == 'submitted':
+            # Generate reference number if not exists
+            if not hasattr(applicant, 'reference_number') or not applicant.reference_number:
+                applicant.reference_number = generate_reference_number(applicant.id)
+                applicant.save()
+            
+            return {
+                "success": False,
+                "message": "Application already submitted",
+                "is_duplicate": True,
+                "submission": {
+                    "id": applicant.id,
+                    "reference_number": applicant.reference_number,
+                    "status": applicant.status,
+                    "submitted_at": applicant.application_date.isoformat() if applicant.application_date else None,
+                    "programme_name": applicant.selected_programme_name or applicant.program or "Not specified"
+                },
+                "email_sent": False
+            }, 409
+        
+        # Check if all requirements are met
+        missing_items = []
+        
+        # Check personal details
+        if not applicant.first_name or not applicant.last_name or not applicant.email:
+            missing_items.append("Personal details")
+        
+        # Check next of kin
+        if not NextOfKin.objects.filter(user=user).exists():
+            missing_items.append("Next of kin information")
+        
+        # Check subject records
+        if not SubjectRecord.objects.filter(user=user).exists():
+            missing_items.append("Academic records")
+        
+        # Check selected programme
+        programme = None
+        if programme_id:
+            try:
+                programme = Programme.objects.get(id=programme_id)
+                applicant.selected_programme = programme
+                applicant.selected_programme_name = programme.name
+                applicant.selected_programme_id = programme.id
+                applicant.selected_programme_department = programme.department.name if programme.department else ""
+                applicant.selected_programme_duration = programme.duration
+                applicant.selected_programme_category = programme.category
+                applicant.selected_programme_code = programme.code
+                applicant.save()
+            except Programme.DoesNotExist:
+                missing_items.append("Valid programme selection")
+        else:
+            missing_items.append("Programme selection")
+        
+        # Check documents (optional - based on your requirements)
+        docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant.id))
+        has_documents = False
+        if os.path.exists(docs_dir):
+            files = os.listdir(docs_dir)
+            has_msce = any(f.startswith('msce_') for f in files)
+            has_id = any(f.startswith('id_card_') for f in files)
+            if has_msce and has_id:
+                has_documents = True
+        
+        # Check fee payment (optional - based on your requirements)
+        fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees', str(user.id))
+        has_fee = False
+        if os.path.exists(fees_dir):
+            files = os.listdir(fees_dir)
+            if any(f.startswith('deposit_slip_') for f in files):
+                has_fee = True
+        
+        if missing_items:
+            return {
+                "success": False,
+                "message": f"Cannot submit application. Missing: {', '.join(missing_items)}",
+                "data": {
+                    "missing_items": missing_items
+                }
+            }, 400
+        
+        # Generate reference number
+        reference_number = generate_reference_number(applicant.id)
+        applicant.reference_number = reference_number
+        
+        # Update applicant status to submitted
+        applicant.status = 'submitted'
+        applicant.application_date = datetime.now()
+        applicant.save()
+        
+        print(f"✅ Application submitted successfully for user {user.username}")
+        print(f"📋 Reference number: {reference_number}")
+        
+        # Send confirmation email (optional)
+        email_sent = False
+        try:
+            email_sent = send_application_confirmation_email(
+                user_email=applicant.email,
+                user_name=f"{applicant.first_name} {applicant.last_name}",
+                reference_number=reference_number,
+                programme_name=applicant.selected_programme_name or "your selected programme"
+            )
+        except Exception as email_error:
+            print(f"⚠️ Email sending failed: {email_error}")
+        
+        return {
+            "success": True,
+            "message": "Your application has been submitted successfully!",
+            "data": {
+                "id": applicant.id,
+                "reference_number": reference_number,
+                "status": applicant.status,
+                "submitted_at": applicant.application_date.isoformat(),
+                "programme_name": applicant.selected_programme_name or applicant.program or "Not specified"
+            },
+            "email_sent": email_sent,
+            "is_duplicate": False
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error submitting application: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to submit application: {str(e)}"
+        }, 400
+
+
+# ==================== SUBMISSION STATUS ENDPOINT ====================
+
+@router.get("/submit/status", response={200: dict, 401: dict})
+@router.get("/submit/status/", response={200: dict, 401: dict})
+def get_submission_status(request):
+    """Check if application has been submitted"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            applicant = Applicant.objects.get(user=user)
+            
+            is_submitted = applicant.status == 'submitted'
+            reference_number = getattr(applicant, 'reference_number', None)
+            
+            return {
+                "success": True,
+                "message": "Submission status retrieved",
+                "data": {
+                    "is_submitted": is_submitted,
+                    "reference_number": reference_number,
+                    "status": applicant.status,
+                    "submitted_at": applicant.application_date.isoformat() if applicant.application_date else None
+                }
+            }
+        except Applicant.DoesNotExist:
+            return {
+                "success": True,
+                "message": "No application found",
+                "data": {
+                    "is_submitted": False,
+                    "reference_number": None,
+                    "status": "not_started",
+                    "submitted_at": None
+                }
+            }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error checking submission status: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }, 400
+
+
+# Helper function to generate reference number
+def generate_reference_number(applicant_id):
+    """Generate a unique reference number"""
+    from datetime import datetime
+    prefix = 'MZU'
+    year = datetime.now().strftime('%Y')
+    month = datetime.now().strftime('%m')
+    day = datetime.now().strftime('%d')
+    random_num = str(applicant_id).zfill(6)
+    timestamp = str(int(datetime.now().timestamp()))[-4:]
+    
+    return f"{prefix}/{year}/{month}/{day}/{random_num}-{timestamp}"
+
+
+# Email helper function (add if not already present)
+def send_application_confirmation_email(user_email, user_name, reference_number, programme_name):
+    """Send application confirmation email to applicant"""
+    try:
+        subject = f'Application Confirmation - {reference_number}'
+        
+        html_message = f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                .header {{ background: linear-gradient(135deg, #059669, #047857); color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }}
+                .content {{ padding: 20px; background: #f9fafb; border: 1px solid #e5e7eb; }}
+                .reference {{ background: #f0fdf4; padding: 15px; border-radius: 8px; text-align: center; margin: 20px 0; }}
+                .reference-number {{ font-size: 24px; font-weight: bold; color: #059669; font-family: monospace; letter-spacing: 2px; }}
+                .footer {{ text-align: center; padding: 20px; font-size: 12px; color: #6b7280; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Application Received!</h1>
+                </div>
+                <div class="content">
+                    <p>Dear <strong>{user_name}</strong>,</p>
+                    <p>Thank you for submitting your application. We have successfully received your application for the <strong>{programme_name}</strong> programme.</p>
+                    
+                    <div class="reference">
+                        <p style="margin-bottom: 10px;">Your Application Reference Number:</p>
+                        <div class="reference-number">{reference_number}</div>
+                        <p style="margin-top: 10px; font-size: 14px;">Please keep this number for future reference</p>
+                    </div>
+                    
+                    <h3>Next Steps:</h3>
+                    <ol>
+                        <li>Your application will be reviewed by the admissions committee</li>
+                        <li>You will receive updates via email regarding your application status</li>
+                        <li>Please check your application portal regularly for updates</li>
+                        <li>Use your reference number for any inquiries</li>
+                    </ol>
+                    
+                    <p>If you have any questions, please contact our admissions office.</p>
+                    
+                    <p>Best regards,<br>
+                    <strong>Admissions Office</strong></p>
+                </div>
+                <div class="footer">
+                    <p>This is an automated message, please do not reply to this email.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        '''
+        
+        plain_message = f"""
+        Application Confirmation - {reference_number}
+        
+        Dear {user_name},
+        
+        Thank you for submitting your application. We have successfully received your application for the {programme_name} programme.
+        
+        Your Application Reference Number: {reference_number}
+        
+        Please keep this number for future reference.
+        
+        Next Steps:
+        1. Your application will be reviewed by the admissions committee
+        2. You will receive updates via email regarding your application status
+        3. Please check your application portal regularly for updates
+        4. Use your reference number for any inquiries
+        
+        Best regards,
+        Admissions Office
+        """
+        
+        send_mail(
+            subject,
+            plain_message,
+            settings.DEFAULT_FROM_EMAIL,
+            [user_email],
+            fail_silently=False,
+            html_message=html_message
+        )
+        return True
+    except Exception as e:
+        print(f"Error sending email: {str(e)}")
+        return False
+
+
+        
 # Add router to API
 api.add_router("/", router)
