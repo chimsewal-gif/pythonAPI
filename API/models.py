@@ -262,3 +262,24 @@ class SubjectRecord(models.Model):
     class Meta:
         db_table = 'subject_records'
         ordering = ['-year', 'subject']
+
+
+class CommitteeMember(models.Model):
+    name = models.CharField(max_length=200)
+    role = models.CharField(max_length=100)
+    email = models.EmailField()
+    phone = models.CharField(max_length=20, blank=True, null=True)
+    department = models.CharField(max_length=200, blank=True, null=True)
+    bio = models.TextField(blank=True, null=True)
+    profile_image = models.ImageField(upload_to='committee/', blank=True, null=True)
+    order = models.IntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"{self.name} - {self.role}"
+    
+    class Meta:
+        db_table = 'committee_members'
+        ordering = ['order', 'name']

@@ -2654,6 +2654,507 @@ def send_application_confirmation_email(user_email, user_name, reference_number,
         return False
 
 
+# ==================== COMMITTEE MANAGEMENT ENDPOINTS ====================
+
+class CommitteeMemberSchema(Schema):
+    name: str
+    role: str
+    email: str
+    phone: Optional[str] = None
+    department: Optional[str] = None
+    bio: Optional[str] = None
+
+class CommitteeMemberUpdateSchema(Schema):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    department: Optional[str] = None
+    bio: Optional[str] = None
+    is_active: Optional[bool] = None
+
+# REMOVE the response decorators - let them return directly
+@router.get("/committee/members")
+@router.get("/committee/members/")
+def get_committee_members(request):
+    """Get all committee members from database"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import CommitteeMember
+        
+        members = CommitteeMember.objects.filter(is_active=True).order_by('order', 'name')
+        
+        members_data = []
+        for member in members:
+            members_data.append({
+                "id": member.id,
+                "name": member.name,
+                "role": member.role,
+                "email": member.email,
+                "phone": member.phone or "",
+                "department": member.department or "",
+                "bio": member.bio or "",
+                "order": member.order,
+                "is_active": member.is_active,
+            })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(members_data)} committee members",
+            "data": members_data,
+            "count": len(members_data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching committee members: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": str(e),
+            "data": []
+        }
+
+@router.get("/committee/members/{member_id}")
+@router.get("/committee/members/{member_id}/")
+def get_committee_member(request, member_id: int):
+    """Get a single committee member by ID"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import CommitteeMember
+        
+        try:
+            member = CommitteeMember.objects.get(id=member_id)
+        except CommitteeMember.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"Committee member with ID {member_id} not found"
+            }, 404
+        
+        return {
+            "success": True,
+            "message": "Committee member retrieved successfully",
+            "data": {
+                "id": member.id,
+                "name": member.name,
+                "role": member.role,
+                "email": member.email,
+                "phone": member.phone or "",
+                "department": member.department or "",
+                "bio": member.bio or "",
+                "order": member.order,
+                "is_active": member.is_active,
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching committee member: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@router.post("/committee/members")
+@router.post("/committee/members/")
+def create_committee_member(request, data: CommitteeMemberSchema):
+    """Create a new committee member in database"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import CommitteeMember
+        
+        if CommitteeMember.objects.filter(email=data.email).exists():
+            return {
+                "success": False,
+                "message": f"Committee member with email {data.email} already exists"
+            }, 400
+        
+        member = CommitteeMember.objects.create(
+            name=data.name,
+            role=data.role,
+            email=data.email,
+            phone=data.phone or "",
+            department=data.department or "",
+            bio=data.bio or "",
+            order=CommitteeMember.objects.count() + 1
+        )
+        
+        return {
+            "success": True,
+            "message": "Committee member created successfully",
+            "data": {
+                "id": member.id,
+                "name": member.name,
+                "role": member.role,
+                "email": member.email,
+                "phone": member.phone,
+                "department": member.department,
+                "bio": member.bio,
+                "order": member.order,
+                "is_active": member.is_active
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating committee member: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@router.put("/committee/members/{member_id}")
+@router.put("/committee/members/{member_id}/")
+def update_committee_member(request, member_id: int, data: CommitteeMemberUpdateSchema):
+    """Update a committee member in database"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import CommitteeMember
+        
+        try:
+            member = CommitteeMember.objects.get(id=member_id)
+        except CommitteeMember.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"Committee member with ID {member_id} not found"
+            }, 404
+        
+        if data.name is not None:
+            member.name = data.name
+        if data.role is not None:
+            member.role = data.role
+        if data.email is not None:
+            if CommitteeMember.objects.filter(email=data.email).exclude(id=member_id).exists():
+                return {
+                    "success": False,
+                    "message": f"Committee member with email {data.email} already exists"
+                }, 400
+            member.email = data.email
+        if data.phone is not None:
+            member.phone = data.phone
+        if data.department is not None:
+            member.department = data.department
+        if data.bio is not None:
+            member.bio = data.bio
+        if data.is_active is not None:
+            member.is_active = data.is_active
+        
+        member.save()
+        
+        return {
+            "success": True,
+            "message": "Committee member updated successfully",
+            "data": {
+                "id": member.id,
+                "name": member.name,
+                "role": member.role,
+                "email": member.email,
+                "phone": member.phone,
+                "department": member.department,
+                "bio": member.bio,
+                "order": member.order,
+                "is_active": member.is_active
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating committee member: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@router.delete("/committee/members/{member_id}")
+@router.delete("/committee/members/{member_id}/")
+def delete_committee_member(request, member_id: int):
+    """Delete a committee member from database"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import CommitteeMember
+        
+        try:
+            member = CommitteeMember.objects.get(id=member_id)
+        except CommitteeMember.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"Committee member with ID {member_id} not found"
+            }, 404
+        
+        member_name = member.name
+        member.delete()
+        
+        return {
+            "success": True,
+            "message": f"Committee member '{member_name}' deleted successfully"
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting committee member: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@router.patch("/committee/members/reorder")
+@router.patch("/committee/members/reorder/")
+def reorder_committee_members(request):
+    """Reorder committee members"""
+    try:
+        user = get_user_from_token(request)
+        
+        import json
+        body = json.loads(request.body) if request.body else {}
+        member_ids = body.get('member_ids', [])
+        
+        if not member_ids:
+            return {
+                "success": False,
+                "message": "Member IDs are required"
+            }, 400
+        
+        from .models import CommitteeMember
+        
+        for index, member_id in enumerate(member_ids):
+            try:
+                member = CommitteeMember.objects.get(id=member_id)
+                member.order = index
+                member.save()
+            except CommitteeMember.DoesNotExist:
+                pass
+        
+        return {
+            "success": True,
+            "message": "Committee members reordered successfully"
+        }
+        
+    except Exception as e:
+        print(f"Error reordering committee members: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+# ==================== PASSWORD RESET WITH OTP ====================
+
+import random
+from django.core.cache import cache
+from django.core.mail import send_mail
+
+class PasswordResetOTPSchema(Schema):
+    email: str
+
+class VerifyOTPSchema(Schema):
+    email: str
+    otp: str
+
+class PasswordResetConfirmSchema(Schema):
+    token: str
+    email: str
+    new_password: str
+    confirm_password: str
+
+@router.post("/password-reset/send-otp")
+@router.post("/password-reset/send-otp/")
+def send_password_reset_otp(request, data: PasswordResetOTPSchema):
+    """Send OTP to user's email for password reset"""
+    try:
+        email = data.email
+        
+        # Check if user exists
+        try:
+            user = User.objects.get(email=email)
+        except User.DoesNotExist:
+            # Don't reveal that user doesn't exist for security
+            return {
+                "success": True,
+                "message": "If an account exists, an OTP has been sent."
+            }
+        
+        # Generate 6-digit OTP
+        otp = f"{random.randint(100000, 999999)}"
+        
+        # Store OTP in cache with 10-minute expiry
+        cache_key = f"password_reset_otp_{email}"
+        cache.set(cache_key, otp, timeout=600)  # 10 minutes
+        
+        print(f"OTP for {email}: {otp}")  # For debugging
+        
+        # Send email with OTP
+        html_message = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+                .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+                .header {{ background: linear-gradient(135deg, #059669, #047857); color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }}
+                .otp {{ font-size: 32px; font-weight: bold; color: #059669; text-align: center; padding: 20px; letter-spacing: 5px; }}
+                .footer {{ text-align: center; padding: 20px; font-size: 12px; color: #6b7280; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>Password Reset OTP</h1>
+                </div>
+                <div class="content" style="padding: 20px;">
+                    <p>Hello {user.username},</p>
+                    <p>You requested to reset your password. Use the following OTP to verify your identity:</p>
+                    <div class="otp">{otp}</div>
+                    <p>This OTP will expire in 10 minutes.</p>
+                    <p>If you didn't request this, please ignore this email.</p>
+                </div>
+                <div class="footer">
+                    <p>&copy; 2024 Mzuzu University. All rights reserved.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        send_mail(
+            'Password Reset OTP',
+            f'Your OTP for password reset is: {otp}. This OTP will expire in 10 minutes.',
+            settings.DEFAULT_FROM_EMAIL,
+            [email],
+            fail_silently=False,
+            html_message=html_message
+        )
+        
+        return {
+            "success": True,
+            "message": "OTP sent successfully."
+        }
+        
+    except Exception as e:
+        print(f"Send OTP error: {str(e)}")
+        return {
+            "success": False,
+            "message": "Failed to send OTP. Please try again."
+        }
+
+@router.post("/password-reset/verify-otp")
+@router.post("/password-reset/verify-otp/")
+def verify_password_reset_otp(request, data: VerifyOTPSchema):
+    """Verify OTP and return reset token"""
+    try:
+        email = data.email
+        otp = data.otp
+        
+        cache_key = f"password_reset_otp_{email}"
+        stored_otp = cache.get(cache_key)
+        
+        if not stored_otp:
+            return {
+                "success": False,
+                "message": "OTP has expired. Please request a new one."
+            }
+        
+        if stored_otp != otp:
+            return {
+                "success": False,
+                "message": "Invalid OTP. Please try again."
+            }
+        
+        # Generate reset token
+        import uuid
+        reset_token = str(uuid.uuid4())
+        
+        # Store reset token with 1-hour expiry
+        token_cache_key = f"password_reset_token_{reset_token}"
+        cache.set(token_cache_key, email, timeout=3600)  # 1 hour
+        
+        # Clear OTP cache
+        cache.delete(cache_key)
+        
+        return {
+            "success": True,
+            "message": "OTP verified successfully.",
+            "reset_token": reset_token
+        }
+        
+    except Exception as e:
+        print(f"Verify OTP error: {str(e)}")
+        return {
+            "success": False,
+            "message": "Failed to verify OTP. Please try again."
+        }
+
+@router.post("/password-reset/confirm")
+@router.post("/password-reset/confirm/")
+def password_reset_confirm(request, data: PasswordResetConfirmSchema):
+    """Confirm password reset with token"""
+    try:
+        token = data.token
+        email = data.email
+        new_password = data.new_password
+        confirm_password = data.confirm_password
+        
+        if new_password != confirm_password:
+            return {
+                "success": False,
+                "message": "Passwords do not match"
+            }
+        
+        if len(new_password) < 8:
+            return {
+                "success": False,
+                "message": "Password must be at least 8 characters"
+            }
+        
+        # Verify reset token
+        token_cache_key = f"password_reset_token_{token}"
+        stored_email = cache.get(token_cache_key)
+        
+        if not stored_email or stored_email != email:
+            return {
+                "success": False,
+                "message": "Invalid or expired reset link. Please request a new one."
+            }
+        
+        # Update user password
+        try:
+            user = User.objects.get(email=email)
+            user.set_password(new_password)
+            user.save()
+            
+            # Clear the token
+            cache.delete(token_cache_key)
+            
+            return {
+                "success": True,
+                "message": "Password has been reset successfully. Please login with your new password."
+            }
+            
+        except User.DoesNotExist:
+            return {
+                "success": False,
+                "message": "User not found."
+            }
+            
+    except Exception as e:
+        print(f"Password reset confirm error: {str(e)}")
+        return {
+            "success": False,
+            "message": "Failed to reset password. Please try again."
+        }
+
+
+
         
 # Add router to API
 api.add_router("/", router)
