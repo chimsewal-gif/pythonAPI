@@ -169,3 +169,10 @@ EMAIL_USE_TLS = True
 EMAIL_HOST_USER = 'chimsewal@gmail.com'  # Your email address
 EMAIL_HOST_PASSWORD = 'viru awwt ixdw gkhk'  # Your email password or app password
 DEFAULT_FROM_EMAIL = 'mzuni e-admission  <noreply@mzuni>'
+
+
+
+
+
+
+

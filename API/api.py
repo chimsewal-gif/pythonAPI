@@ -3583,7 +3583,891 @@ def delete_education(request, record_id: int):
             "message": f"Failed to delete education record: {str(e)}"
         }
 
+
+# Add this schema with your other schemas
+class WorkHistorySchema(Schema):
+    organization: str
+    job_title: str
+    employment_type: Optional[str] = None
+    location: Optional[str] = None
+    location_type: Optional[str] = None
+    start_date: str
+    end_date: Optional[str] = None
+    currently_working: bool = False
+    responsibilities: Optional[str] = None
+
+# ==================== WORK HISTORY ENDPOINTS ====================
+
+@router.get("/work-history", response={200: dict, 401: dict})
+@router.get("/work-history/", response={200: dict, 401: dict})
+def get_work_history(request):
+    """Get all work history records for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
         
+        from .models import WorkHistory
+        
+        records = WorkHistory.objects.filter(user=user).order_by('-start_date')
+        
+        data = []
+        for record in records:
+            data.append({
+                "id": record.id,
+                "organization": record.organization,
+                "job_title": record.job_title,
+                "employment_type": record.employment_type,
+                "location": record.location,
+                "location_type": record.location_type,
+                "start_date": record.start_date.isoformat() if record.start_date else None,
+                "end_date": record.end_date.isoformat() if record.end_date else None,
+                "currently_working": record.currently_working,
+                "responsibilities": record.responsibilities,
+                "created_at": record.created_at.isoformat() if record.created_at else None,
+                "updated_at": record.updated_at.isoformat() if record.updated_at else None
+            })
+        
+        return {
+            "success": True,
+            "message": "Work history retrieved successfully",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching work history: {str(e)}")
+        return {
+            "success": True,
+            "message": "No work history found",
+            "data": [],
+            "count": 0
+        }
+
+
+@router.post("/work-history", response={200: dict, 401: dict})
+@router.post("/work-history/", response={200: dict, 401: dict})
+def create_work_history(request, data: WorkHistorySchema):
+    """Create a new work history record"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import WorkHistory
+        
+        record = WorkHistory.objects.create(
+            user=user,
+            organization=data.organization,
+            job_title=data.job_title,
+            employment_type=data.employment_type,
+            location=data.location,
+            location_type=data.location_type,
+            start_date=data.start_date,
+            end_date=data.end_date if not data.currently_working else None,
+            currently_working=data.currently_working,
+            responsibilities=data.responsibilities,
+        )
+        
+        return {
+            "success": True,
+            "message": "Work history record created successfully",
+            "data": {
+                "id": record.id,
+                "organization": record.organization,
+                "job_title": record.job_title,
+                "employment_type": record.employment_type,
+                "location": record.location,
+                "location_type": record.location_type,
+                "start_date": record.start_date.isoformat() if record.start_date else None,
+                "end_date": record.end_date.isoformat() if record.end_date else None,
+                "currently_working": record.currently_working,
+                "responsibilities": record.responsibilities,
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating work history: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to create work history record: {str(e)}"
+        }
+
+
+@router.put("/work-history/{record_id}", response={200: dict, 401: dict, 404: dict})
+@router.put("/work-history/{record_id}/", response={200: dict, 401: dict, 404: dict})
+def update_work_history(request, record_id: int, data: WorkHistorySchema):
+    """Update a work history record"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import WorkHistory
+        
+        try:
+            record = WorkHistory.objects.get(id=record_id, user=user)
+        except WorkHistory.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Work history record not found"
+            }
+        
+        record.organization = data.organization
+        record.job_title = data.job_title
+        record.employment_type = data.employment_type
+        record.location = data.location
+        record.location_type = data.location_type
+        record.start_date = data.start_date
+        record.end_date = data.end_date if not data.currently_working else None
+        record.currently_working = data.currently_working
+        record.responsibilities = data.responsibilities
+        record.save()
+        
+        return {
+            "success": True,
+            "message": "Work history record updated successfully",
+            "data": {
+                "id": record.id,
+                "organization": record.organization,
+                "job_title": record.job_title,
+                "employment_type": record.employment_type,
+                "location": record.location,
+                "location_type": record.location_type,
+                "start_date": record.start_date.isoformat() if record.start_date else None,
+                "end_date": record.end_date.isoformat() if record.end_date else None,
+                "currently_working": record.currently_working,
+                "responsibilities": record.responsibilities,
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating work history: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to update work history record: {str(e)}"
+        }
+
+
+@router.delete("/work-history/{record_id}", response={200: dict, 401: dict, 404: dict})
+@router.delete("/work-history/{record_id}/", response={200: dict, 401: dict, 404: dict})
+def delete_work_history(request, record_id: int):
+    """Delete a work history record"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import WorkHistory
+        
+        try:
+            record = WorkHistory.objects.get(id=record_id, user=user)
+        except WorkHistory.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Work history record not found"
+            }
+        
+        record.delete()
+        
+        return {
+            "success": True,
+            "message": "Work history record deleted successfully",
+            "data": None
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting work history: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to delete work history record: {str(e)}"
+        }
+
+# Add this schema with your other schemas
+class PublicationSchema(Schema):
+    title: str
+    journal: str
+    year: str
+    link: Optional[str] = None
+    authors: Optional[str] = None
+    doi: Optional[str] = None
+
+# ==================== PUBLICATIONS ENDPOINTS ====================
+
+@router.get("/publications", response={200: dict, 401: dict})
+@router.get("/publications/", response={200: dict, 401: dict})
+def get_publications(request):
+    """Get all publications for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Publication
+        
+        records = Publication.objects.filter(user=user).order_by('-year')
+        
+        data = []
+        for record in records:
+            data.append({
+                "id": record.id,
+                "title": record.title,
+                "journal": record.journal,
+                "year": record.year,
+                "link": record.link,
+                "authors": record.authors,
+                "doi": record.doi,
+                "created_at": record.created_at.isoformat() if record.created_at else None,
+                "updated_at": record.updated_at.isoformat() if record.updated_at else None
+            })
+        
+        return {
+            "success": True,
+            "message": "Publications retrieved successfully",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching publications: {str(e)}")
+        return {
+            "success": True,
+            "message": "No publications found",
+            "data": [],
+            "count": 0
+        }
+
+
+@router.post("/publications", response={200: dict, 401: dict})
+@router.post("/publications/", response={200: dict, 401: dict})
+def create_publication(request, data: PublicationSchema):
+    """Create a new publication record"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Publication
+        
+        # Validate year
+        current_year = datetime.now().year
+        year = int(data.year)
+        if year < 1900 or year > current_year + 5:
+            return {
+                "success": False,
+                "message": f"Year must be between 1900 and {current_year + 5}"
+            }
+        
+        record = Publication.objects.create(
+            user=user,
+            title=data.title,
+            journal=data.journal,
+            year=data.year,
+            link=data.link,
+            authors=data.authors,
+            doi=data.doi,
+        )
+        
+        return {
+            "success": True,
+            "message": "Publication created successfully",
+            "data": {
+                "id": record.id,
+                "title": record.title,
+                "journal": record.journal,
+                "year": record.year,
+                "link": record.link,
+                "authors": record.authors,
+                "doi": record.doi,
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating publication: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to create publication: {str(e)}"
+        }
+
+
+@router.put("/publications/{record_id}", response={200: dict, 401: dict, 404: dict})
+@router.put("/publications/{record_id}/", response={200: dict, 401: dict, 404: dict})
+def update_publication(request, record_id: int, data: PublicationSchema):
+    """Update a publication record"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Publication
+        
+        try:
+            record = Publication.objects.get(id=record_id, user=user)
+        except Publication.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Publication not found"
+            }
+        
+        # Validate year
+        current_year = datetime.now().year
+        year = int(data.year)
+        if year < 1900 or year > current_year + 5:
+            return {
+                "success": False,
+                "message": f"Year must be between 1900 and {current_year + 5}"
+            }
+        
+        record.title = data.title
+        record.journal = data.journal
+        record.year = data.year
+        record.link = data.link
+        record.authors = data.authors
+        record.doi = data.doi
+        record.save()
+        
+        return {
+            "success": True,
+            "message": "Publication updated successfully",
+            "data": {
+                "id": record.id,
+                "title": record.title,
+                "journal": record.journal,
+                "year": record.year,
+                "link": record.link,
+                "authors": record.authors,
+                "doi": record.doi,
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating publication: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to update publication: {str(e)}"
+        }
+
+
+@router.delete("/publications/{record_id}", response={200: dict, 401: dict, 404: dict})
+@router.delete("/publications/{record_id}/", response={200: dict, 401: dict, 404: dict})
+def delete_publication(request, record_id: int):
+    """Delete a publication record"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Publication
+        
+        try:
+            record = Publication.objects.get(id=record_id, user=user)
+        except Publication.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Publication not found"
+            }
+        
+        record.delete()
+        
+        return {
+            "success": True,
+            "message": "Publication deleted successfully",
+            "data": None
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting publication: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to delete publication: {str(e)}"
+        }
+
+# Add this schema with your other schemas
+class EssaySchema(Schema):
+    motivation: str
+    research_concept_note: Optional[str] = None
+
+# ==================== ESSAY ENDPOINTS ====================
+
+@router.get("/essay", response={200: dict, 401: dict})
+@router.get("/essay/", response={200: dict, 401: dict})
+def get_essay(request):
+    """Get essay for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Essay
+        
+        try:
+            essay = Essay.objects.get(user=user)
+            return {
+                "success": True,
+                "message": "Essay retrieved successfully",
+                "data": {
+                    "id": essay.id,
+                    "motivation": essay.motivation,
+                    "research_concept_note": essay.research_concept_note,
+                    "created_at": essay.created_at.isoformat() if essay.created_at else None,
+                    "updated_at": essay.updated_at.isoformat() if essay.updated_at else None
+                }
+            }
+        except Essay.DoesNotExist:
+            return {
+                "success": True,
+                "message": "No essay found",
+                "data": {
+                    "motivation": "",
+                    "research_concept_note": ""
+                }
+            }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching essay: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to fetch essay: {str(e)}",
+            "data": None
+        }
+
+
+@router.post("/essay", response={200: dict, 401: dict})
+@router.post("/essay/", response={200: dict, 401: dict})
+def save_essay(request, data: EssaySchema):
+    """Save or update essay for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Essay
+        
+        # Validate word count for motivation (max 500 words)
+        motivation_words = len(data.motivation.split())
+        if motivation_words > 500:
+            return {
+                "success": False,
+                "message": f"Motivation exceeds 500 words. Current word count: {motivation_words}"
+            }
+        
+        # Validate word count for research concept note if provided (max 1000 words)
+        if data.research_concept_note:
+            research_words = len(data.research_concept_note.split())
+            if research_words > 1000:
+                return {
+                    "success": False,
+                    "message": f"Research concept note exceeds 1000 words. Current word count: {research_words}"
+                }
+        
+        essay, created = Essay.objects.update_or_create(
+            user=user,
+            defaults={
+                'motivation': data.motivation,
+                'research_concept_note': data.research_concept_note,
+            }
+        )
+        
+        return {
+            "success": True,
+            "message": "Essay saved successfully",
+            "data": {
+                "id": essay.id,
+                "motivation": essay.motivation,
+                "research_concept_note": essay.research_concept_note,
+                "word_count": {
+                    "motivation": motivation_words,
+                    "research_concept_note": len(data.research_concept_note.split()) if data.research_concept_note else 0
+                }
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error saving essay: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to save essay: {str(e)}"
+        }
+
+# Add these schemas with your other schema definitions
+
+class RefereeSchema(Schema):
+    title: str
+    first_name: str
+    last_name: str
+    gender: str
+    email: str
+    phone_number: str
+    referee_type: str
+
+class RefereeResponseSchema(Schema):
+    id: int
+    title: str
+    first_name: str
+    last_name: str
+    gender: str
+    email: str
+    phone_number: str
+    referee_type: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+# ==================== REFEREE ENDPOINTS (Nested under applicants) ====================
+
+# First, make sure the schema is defined
+class RefereeSchema(Schema):
+    title: str
+    first_name: str
+    last_name: str
+    gender: str
+    email: str
+    phone_number: str
+    referee_type: str
+
+class RefereeResponseSchema(Schema):
+    success: bool
+    message: str
+    data: Optional[dict] = None
+    count: Optional[int] = None
+
+@router.get("/applicants/{applicant_id}/referees")
+@router.get("/applicants/{applicant_id}/referees/")
+def get_referees(request, applicant_id: int):
+    """Get all referees for an applicant"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Referee, Applicant
+        
+        # Verify the applicant belongs to the user
+        try:
+            applicant = Applicant.objects.get(id=applicant_id, user=user)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Applicant not found"
+            }
+        
+        referees = Referee.objects.filter(user=user).order_by('-created_at')
+        
+        data = []
+        for referee in referees:
+            # Map gender from DB to frontend format
+            gender_mapping = {
+                'M': 'Male',
+                'F': 'Female',
+                'NB': 'Non-binary',
+                'O': 'Prefer not to say',
+                'OT': 'Other',
+            }
+            
+            data.append({
+                "id": referee.id,
+                "title": referee.title,
+                "first_name": referee.first_name,
+                "last_name": referee.last_name,
+                "gender": gender_mapping.get(referee.gender, 'Other'),
+                "email": referee.email,
+                "phone_number": referee.phone_number,
+                "referee_type": referee.referee_type,
+                "created_at": referee.created_at.isoformat() if referee.created_at else None,
+                "updated_at": referee.updated_at.isoformat() if referee.updated_at else None
+            })
+        
+        return {
+            "success": True,
+            "message": "Referees retrieved successfully",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching referees: {str(e)}")
+        return {
+            "success": True,
+            "message": "No referees found",
+            "data": [],
+            "count": 0
+        }
+
+
+@router.post("/applicants/{applicant_id}/referees")
+@router.post("/applicants/{applicant_id}/referees/")
+def create_referee(request, applicant_id: int, data: RefereeSchema):
+    """Create a new referee for an applicant"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Referee, Applicant
+        
+        # Verify the applicant belongs to the user
+        try:
+            applicant = Applicant.objects.get(id=applicant_id, user=user)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Applicant not found"
+            }
+        
+        # Validate required fields
+        if not data.first_name or not data.first_name.strip():
+            return {
+                "success": False,
+                "message": "First name is required"
+            }
+        
+        if not data.last_name or not data.last_name.strip():
+            return {
+                "success": False,
+                "message": "Last name is required"
+            }
+        
+        # Validate email format
+        if not data.email or '@' not in data.email or '.' not in data.email:
+            return {
+                "success": False,
+                "message": "Invalid email format"
+            }
+        
+        # Validate phone number (basic validation)
+        if not data.phone_number or len(data.phone_number) < 10:
+            return {
+                "success": False,
+                "message": "Phone number must be at least 10 digits"
+            }
+        
+        # Validate title
+        valid_titles = ['Dr.', 'Prof.', 'Mr.', 'Ms.', 'Mrs.', 'Mx.']
+        if data.title not in valid_titles:
+            return {
+                "success": False,
+                "message": f"Invalid title. Must be one of: {', '.join(valid_titles)}"
+            }
+        
+        # Validate referee type
+        valid_referee_types = ['Academic', 'Professional', 'Personal', 'Supervisor', 'Manager', 'Colleague']
+        if data.referee_type not in valid_referee_types:
+            return {
+                "success": False,
+                "message": f"Invalid referee type. Must be one of: {', '.join(valid_referee_types)}"
+            }
+        
+        # Map gender from frontend values to database choices
+        gender_mapping = {
+            'Male': 'M',
+            'Female': 'F',
+            'Non-binary': 'NB',
+            'Prefer not to say': 'O',
+            'Other': 'OT',
+        }
+        
+        db_gender = gender_mapping.get(data.gender, 'O')
+        
+        # Create referee
+        referee = Referee.objects.create(
+            user=user,
+            title=data.title,
+            first_name=data.first_name.strip(),
+            last_name=data.last_name.strip(),
+            gender=db_gender,
+            email=data.email.strip(),
+            phone_number=data.phone_number.strip(),
+            referee_type=data.referee_type,
+        )
+        
+        # Create notification for the user
+        try:
+            from .models import Notification
+            Notification.objects.create(
+                user=user,
+                title="Referee Added",
+                message=f"Referee {referee.get_full_name()} has been added successfully.",
+                notification_type="info",
+                link="/dashboard/referees"
+            )
+        except Exception as notif_error:
+            print(f"Could not create notification: {notif_error}")
+        
+        # Return with gender mapped back for frontend
+        gender_reverse = {v: k for k, v in gender_mapping.items()}
+        
+        return {
+            "success": True,
+            "message": "Referee created successfully",
+            "data": {
+                "id": referee.id,
+                "title": referee.title,
+                "first_name": referee.first_name,
+                "last_name": referee.last_name,
+                "gender": gender_reverse.get(referee.gender, 'Other'),
+                "email": referee.email,
+                "phone_number": referee.phone_number,
+                "referee_type": referee.referee_type,
+                "created_at": referee.created_at.isoformat() if referee.created_at else None
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating referee: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to create referee: {str(e)}"
+        }
+
+
+@router.put("/applicants/{applicant_id}/referees/{referee_id}")
+@router.put("/applicants/{applicant_id}/referees/{referee_id}/")
+def update_referee(request, applicant_id: int, referee_id: int, data: RefereeSchema):
+    """Update an existing referee"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Referee, Applicant
+        
+        # Verify the applicant belongs to the user
+        try:
+            applicant = Applicant.objects.get(id=applicant_id, user=user)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Applicant not found"
+            }
+        
+        try:
+            referee = Referee.objects.get(id=referee_id, user=user)
+        except Referee.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Referee not found"
+            }
+        
+        # Validate required fields
+        if not data.first_name or not data.first_name.strip():
+            return {
+                "success": False,
+                "message": "First name is required"
+            }
+        
+        if not data.last_name or not data.last_name.strip():
+            return {
+                "success": False,
+                "message": "Last name is required"
+            }
+        
+        # Validate email format
+        if not data.email or '@' not in data.email or '.' not in data.email:
+            return {
+                "success": False,
+                "message": "Invalid email format"
+            }
+        
+        # Validate phone number
+        if not data.phone_number or len(data.phone_number) < 10:
+            return {
+                "success": False,
+                "message": "Phone number must be at least 10 digits"
+            }
+        
+        # Map gender
+        gender_mapping = {
+            'Male': 'M',
+            'Female': 'F',
+            'Non-binary': 'NB',
+            'Prefer not to say': 'O',
+            'Other': 'OT',
+        }
+        
+        db_gender = gender_mapping.get(data.gender, 'O')
+        
+        # Update referee
+        referee.title = data.title
+        referee.first_name = data.first_name.strip()
+        referee.last_name = data.last_name.strip()
+        referee.gender = db_gender
+        referee.email = data.email.strip()
+        referee.phone_number = data.phone_number.strip()
+        referee.referee_type = data.referee_type
+        referee.save()
+        
+        gender_reverse = {v: k for k, v in gender_mapping.items()}
+        
+        return {
+            "success": True,
+            "message": "Referee updated successfully",
+            "data": {
+                "id": referee.id,
+                "title": referee.title,
+                "first_name": referee.first_name,
+                "last_name": referee.last_name,
+                "gender": gender_reverse.get(referee.gender, 'Other'),
+                "email": referee.email,
+                "phone_number": referee.phone_number,
+                "referee_type": referee.referee_type,
+                "updated_at": referee.updated_at.isoformat() if referee.updated_at else None
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating referee: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to update referee: {str(e)}"
+        }
+
+
+@router.delete("/applicants/{applicant_id}/referees/{referee_id}")
+@router.delete("/applicants/{applicant_id}/referees/{referee_id}/")
+def delete_referee(request, applicant_id: int, referee_id: int):
+    """Delete a referee"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Referee, Applicant
+        
+        # Verify the applicant belongs to the user
+        try:
+            applicant = Applicant.objects.get(id=applicant_id, user=user)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Applicant not found"
+            }
+        
+        try:
+            referee = Referee.objects.get(id=referee_id, user=user)
+        except Referee.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Referee not found"
+            }
+        
+        referee_name = referee.get_full_name()
+        referee.delete()
+        
+        return {
+            "success": True,
+            "message": f"Referee '{referee_name}' deleted successfully",
+            "data": None
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting referee: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to delete referee: {str(e)}"
+        }
+
 
 api.add_router("/ml", ml_router)
 api.add_router("/", router)

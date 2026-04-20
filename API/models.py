@@ -352,3 +352,129 @@ class Education(models.Model):
     class Meta:
         db_table = 'education'
         ordering = ['-start_date']
+class WorkHistory(models.Model):
+    EMPLOYMENT_TYPE_CHOICES = [
+        ('Full-time', 'Full-time'),
+        ('Part-time', 'Part-time'),
+        ('Contract', 'Contract'),
+        ('Internship', 'Internship'),
+        ('Temporary', 'Temporary'),
+        ('Freelance', 'Freelance'),
+        ('Self-employed', 'Self-employed'),
+        ('Volunteer', 'Volunteer'),
+    ]
+    
+    LOCATION_TYPE_CHOICES = [
+        ('On-site', 'On-site'),
+        ('Remote', 'Remote'),
+        ('Hybrid', 'Hybrid'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='work_history')
+    organization = models.CharField(max_length=255)
+    job_title = models.CharField(max_length=255)
+    employment_type = models.CharField(max_length=50, choices=EMPLOYMENT_TYPE_CHOICES, blank=True, null=True)
+    location = models.CharField(max_length=255, blank=True, null=True)
+    location_type = models.CharField(max_length=50, choices=LOCATION_TYPE_CHOICES, blank=True, null=True)
+    start_date = models.DateField()
+    end_date = models.DateField(null=True, blank=True)
+    currently_working = models.BooleanField(default=False)
+    responsibilities = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"{self.job_title} at {self.organization} ({self.user.username})"
+    
+    class Meta:
+        db_table = 'work_history'
+        ordering = ['-start_date']
+        verbose_name = 'Work History'
+        verbose_name_plural = 'Work History'
+class Publication(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='publications')
+    title = models.CharField(max_length=500)
+    journal = models.CharField(max_length=500)
+    year = models.CharField(max_length=4)
+    link = models.URLField(blank=True, null=True)
+    authors = models.TextField(blank=True, null=True)
+    doi = models.CharField(max_length=100, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"{self.title} ({self.year})"
+    
+    class Meta:
+        db_table = 'publications'
+        ordering = ['-year']
+        verbose_name = 'Publication'
+        verbose_name_plural = 'Publications'
+
+class Essay(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='essays')
+    motivation = models.TextField(help_text="Motivation for applying to the programme (Max 500 words)")
+    research_concept_note = models.TextField(blank=True, null=True, help_text="Research concept note for PhD and Research Masters students (Max 1000 words)")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"Essay for {self.user.username}"
+    
+    class Meta:
+        db_table = 'essays'
+        verbose_name = 'Essay'
+        verbose_name_plural = 'Essays'
+
+# Add this to your models.py file with the other models
+
+class Referee(models.Model):
+    TITLE_CHOICES = [
+        ('Mr', 'Mr'),
+        ('Mrs', 'Mrs'),
+        ('Miss', 'Miss'),
+        ('Ms', 'Ms'),
+        ('Dr', 'Dr'),
+        ('Prof', 'Prof'),
+        ('Mx', 'Mx'),
+    ]
+    
+    GENDER_CHOICES = [
+        ('M', 'Male'),
+        ('F', 'Female'),
+        ('NB', 'Non-binary'),
+        ('O', 'Prefer not to say'),
+        ('OT', 'Other'),
+    ]
+    
+    REFEREE_TYPE_CHOICES = [
+        ('Academic', 'Academic'),
+        ('Professional', 'Professional'),
+        ('Personal', 'Personal'),
+        ('Supervisor', 'Supervisor'),
+        ('Manager', 'Manager'),
+        ('Colleague', 'Colleague'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='referees')
+    title = models.CharField(max_length=10, choices=TITLE_CHOICES)
+    first_name = models.CharField(max_length=100)
+    last_name = models.CharField(max_length=100)
+    gender = models.CharField(max_length=10, choices=GENDER_CHOICES)
+    email = models.EmailField()
+    phone_number = models.CharField(max_length=20)
+    referee_type = models.CharField(max_length=50, choices=REFEREE_TYPE_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"{self.title} {self.first_name} {self.last_name} ({self.referee_type})"
+    
+    def get_full_name(self):
+        return f"{self.title} {self.first_name} {self.last_name}"
+    
+    class Meta:
+        db_table = 'referees'
+        ordering = ['-created_at']
+        verbose_name = 'Referee'
+        verbose_name_plural = 'Referees'
