@@ -283,3 +283,72 @@ class CommitteeMember(models.Model):
     class Meta:
         db_table = 'committee_members'
         ordering = ['order', 'name']
+
+# models.py - Add this model
+
+class Notification(models.Model):
+    NOTIFICATION_TYPES = [
+        ('application', 'Application Update'),
+        ('payment', 'Payment Update'),
+        ('system', 'System Notification'),
+        ('reminder', 'Reminder'),
+        ('info', 'Information'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
+    title = models.CharField(max_length=200)
+    message = models.TextField()
+    notification_type = models.CharField(max_length=20, choices=NOTIFICATION_TYPES, default='info')
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    link = models.CharField(max_length=500, blank=True, null=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.title} - {self.user.username}"
+
+class ProgrammeChoice(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='programme_choices')
+    choice_number = models.IntegerField()
+    programme_id = models.IntegerField()
+    programme_name = models.CharField(max_length=500)
+    department = models.CharField(max_length=200, blank=True)
+    duration = models.CharField(max_length=100, blank=True)
+    category = models.CharField(max_length=100, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['choice_number']
+        unique_together = ['user', 'choice_number']
+    
+    def __str__(self):
+        return f"{self.user.username} - Choice {self.choice_number}: {self.programme_name}"
+
+# Django model example
+class Document(models.Model):
+    applicant = models.ForeignKey(Applicant, on_delete=models.CASCADE)
+    document_name = models.CharField(max_length=255)
+    document_type = models.CharField(max_length=100)
+    file = models.FileField(upload_to='documents/')
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+# Add this model to your models.py
+
+class Education(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='education_records')
+    qualification_type = models.CharField(max_length=100)
+    institution = models.CharField(max_length=255)
+    start_date = models.DateField()
+    end_date = models.DateField(null=True, blank=True)
+    currently_studying = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"{self.qualification_type} - {self.institution} ({self.user.username})"
+    
+    class Meta:
+        db_table = 'education'
+        ordering = ['-start_date']

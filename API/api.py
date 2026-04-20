@@ -5,17 +5,30 @@ from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
 from django.conf import settings
 import jwt
+from typing import Optional, List
 import os
 import json
 from django.core.mail import send_mail
 from django.template.loader import render_to_string
 from django.utils.html import strip_tags
-
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
+from .ml.endpoints import ml_router
 
 from datetime import datetime, timedelta, timezone
-from .models import Applicant, NextOfKin, SubjectRecord, Department, Programme, Application, FeePayment, FeeStatus
+from .models import (
+    Applicant, 
+    NextOfKin, 
+    SubjectRecord, 
+    Department, 
+    Programme, 
+    Application, 
+    FeePayment, 
+    FeeStatus, 
+    CommitteeMember, 
+    Notification, 
+    ProgrammeChoice
+)
 
 api = NinjaAPI()
 router = Router()
@@ -253,7 +266,7 @@ def register_applicant(request, data: ApplicantRegistrationSchema):
         
         token = create_jwt_token(user)
         
-        return 200, {
+        return {
             "success": True,
             "message": "Registration successful!",
             "user": {
@@ -271,7 +284,7 @@ def register_applicant(request, data: ApplicantRegistrationSchema):
         raise
     except Exception as e:
         print(f"Registration error: {str(e)}")
-        return {"success": False, "message": f"Registration failed: {str(e)}"}, 400
+        return {"success": False, "message": f"Registration failed: {str(e)}"}
 
 @router.get("/me", response={200: dict, 401: dict})
 @router.get("/me/", response={200: dict, 401: dict})
@@ -1115,7 +1128,7 @@ def get_programmes(request):
             data.append({
                 "id": prog.id,
                 "name": prog.name,
-                "description": prog.description,
+                "description": prog.description or "",
                 "department": prog.department.name if prog.department else "Not Assigned",
                 "duration": prog.duration,
                 "category": prog.category,
@@ -1161,7 +1174,7 @@ def get_programme(request, programme_id: int):
             "data": {
                 "id": prog.id,
                 "name": prog.name,
-                "description": prog.description,
+                "description": prog.description or "",
                 "department": prog.department.name if prog.department else "Not Assigned",
                 "department_id": prog.department.id if prog.department else None,
                 "duration": prog.duration,
@@ -1182,39 +1195,52 @@ def get_programme(request, programme_id: int):
             "message": str(e)
         }
 
-@router.post("/programmes", response={201: dict, 400: dict, 401: dict})
-@router.post("/programmes/", response={201: dict, 400: dict, 401: dict})
+@router.post("/programmes")
+@router.post("/programmes/")
 def create_programme(request, data: ProgrammeSchema):
     """Create a new programme"""
     try:
         user = get_user_from_token(request)
         
-        print(f"Creating programme with data: {data.dict()}")
+        print(f"📝 Creating programme: {data.name}")
+        print(f"   Department: {data.department}")
+        print(f"   Category: {data.category}")
+        print(f"   Duration: {data.duration}")
         
-        try:
-            department_obj = Department.objects.get(name=data.department)
-        except Department.DoesNotExist:
-            return {
-                "success": False,
-                "message": f"Department '{data.department}' not found. Please create the department first."
-            }, 400
+        # Get or create department
+        department_obj, created = Department.objects.get_or_create(
+            name=data.department,
+            defaults={
+                'code': data.department[:10].upper().replace(' ', ''),
+                'description': f"Department of {data.department}",
+                'is_active': True
+            }
+        )
         
+        if created:
+            print(f"✅ Created new department: {department_obj.name}")
+        
+        # Check if programme with same name exists
         if Programme.objects.filter(name=data.name).exists():
             return {
                 "success": False,
                 "message": f"Programme with name '{data.name}' already exists"
-            }, 400
+            }
         
+        # Generate code if not provided
         code = data.code
-        if not code:
-            code = ''.join(word[0].upper() for word in data.name.split() if word)[:10]
+        if not code or code == "":
+            words = data.name.split()
+            code = ''.join(word[0].upper() for word in words if word)[:10]
         
+        # Ensure unique code
         original_code = code
         counter = 1
         while Programme.objects.filter(code=code).exists():
             code = f"{original_code}{counter}"
             counter += 1
         
+        # Create the programme
         prog = Programme.objects.create(
             name=data.name,
             description=data.description or "",
@@ -1225,31 +1251,31 @@ def create_programme(request, data: ProgrammeSchema):
             is_active=data.is_active
         )
         
-        return 201, {
-            "success": True,
-            "message": "Programme created successfully",
-            "data": {
-                "id": prog.id,
-                "name": prog.name,
-                "description": prog.description,
-                "department": prog.department.name,
-                "duration": prog.duration,
-                "category": prog.category,
-                "code": prog.code,
-                "is_active": prog.is_active
-            }
+        print(f"✅ Programme created: {prog.name} (ID: {prog.id})")
+        
+        # Return the created programme
+        return {
+            "id": prog.id,
+            "name": prog.name,
+            "description": prog.description,
+            "department": prog.department.name,
+            "duration": prog.duration,
+            "category": prog.category,
+            "code": prog.code,
+            "is_active": prog.is_active
         }
         
     except HttpError:
         raise
     except Exception as e:
-        print(f"Error creating programme: {str(e)}")
+        print(f"❌ Error creating programme: {str(e)}")
         import traceback
         traceback.print_exc()
         return {
             "success": False,
+            "error": str(e),
             "message": f"Failed to create programme: {str(e)}"
-        }, 500
+        }
 
 @router.put("/programmes/{programme_id}", response={200: dict, 400: dict, 404: dict, 401: dict})
 @router.put("/programmes/{programme_id}/", response={200: dict, 400: dict, 404: dict, 401: dict})
@@ -1347,7 +1373,6 @@ def delete_programme(request, programme_id: int):
         }
 
 # ==================== PROGRAMME SELECTION ENDPOINTS ====================
-# IMPORTANT: These MUST come BEFORE the /applicants/{applicant_id} routes
 
 @router.post("/applicants/select-programme", response={200: dict, 400: dict, 401: dict})
 @router.post("/applicants/select-programme/", response={200: dict, 400: dict, 401: dict})
@@ -1432,7 +1457,7 @@ def select_programme(request, data: ProgrammeSelectionSchema):
         return {
             "success": False,
             "message": f"Failed to select programme: {str(e)}"
-        }, 400
+        }
 
 @router.get("/applicants/programme/selection", response={200: dict, 404: dict, 401: dict})
 @router.get("/applicants/programme/selection/", response={200: dict, 404: dict, 401: dict})
@@ -1518,7 +1543,139 @@ def clear_selected_programme(request):
         return {
             "success": False,
             "message": f"Failed to clear selection: {str(e)}"
-        }, 400
+        }
+
+# ==================== PROGRAMME CHOICES ENDPOINTS ====================
+
+class ProgrammeChoiceItemSchema(Schema):
+    choice_number: int
+    programme_id: int
+    programme_name: str
+    department: str
+    duration: str
+    category: str
+
+class ProgrammeChoicesSaveSchema(Schema):
+    choices: List[ProgrammeChoiceItemSchema]
+
+@router.post("/applicants/programme-choices", response={200: dict, 400: dict, 401: dict})
+def save_programme_choices(request, data: ProgrammeChoicesSaveSchema):
+    """Save multiple programme choices for the applicant"""
+    try:
+        user = get_user_from_token(request)
+        print(f"📝 Saving programme choices for user {user.username}")
+        print(f"📊 Received {len(data.choices)} choices")
+        
+        # Validate that we have exactly 6 choices
+        if len(data.choices) != 6:
+            return {
+                "success": False,
+                "message": f"You must select exactly 6 programmes. You selected {len(data.choices)}"
+            }
+        
+        # Validate no duplicate programme IDs
+        programme_ids = [choice.programme_id for choice in data.choices]
+        if len(programme_ids) != len(set(programme_ids)):
+            return {
+                "success": False,
+                "message": "Duplicate programmes detected. Please select 6 different programmes."
+            }
+        
+        # Delete existing choices
+        ProgrammeChoice.objects.filter(user=user).delete()
+        print(f"🗑️ Deleted existing choices")
+        
+        # Create new choices
+        created_choices = []
+        for choice_data in data.choices:
+            try:
+                programme = Programme.objects.get(id=choice_data.programme_id)
+                programme_name = programme.name
+                department = programme.department.name if programme.department else choice_data.department
+                duration = programme.duration or choice_data.duration
+                category = programme.category or choice_data.category
+            except Programme.DoesNotExist:
+                programme_name = choice_data.programme_name
+                department = choice_data.department
+                duration = choice_data.duration
+                category = choice_data.category
+            
+            choice = ProgrammeChoice.objects.create(
+                user=user,
+                choice_number=choice_data.choice_number,
+                programme_id=choice_data.programme_id,
+                programme_name=programme_name,
+                department=department,
+                duration=duration,
+                category=category
+            )
+            created_choices.append({
+                "id": choice.id,
+                "choice_number": choice.choice_number,
+                "programme_id": choice.programme_id,
+                "programme_name": choice.programme_name,
+                "department": choice.department,
+                "duration": choice.duration,
+                "category": choice.category
+            })
+        
+        print(f"✅ Created {len(created_choices)} new programme choices")
+        
+        return {
+            "success": True,
+            "message": f"{len(created_choices)} programme choices saved successfully",
+            "choices": created_choices
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"❌ Error saving programme choices: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to save: {str(e)}"
+        }
+
+@router.get("/applicants/programme-choices", response={200: dict, 401: dict})
+def get_programme_choices(request):
+    """Get the applicant's saved programme choices"""
+    try:
+        user = get_user_from_token(request)
+        print(f"📝 Fetching programme choices for user {user.username}")
+        
+        choices = ProgrammeChoice.objects.filter(user=user).order_by('choice_number')
+        
+        choices_data = []
+        for choice in choices:
+            choices_data.append({
+                "id": choice.id,
+                "choice_number": choice.choice_number,
+                "programme_id": choice.programme_id,
+                "programme_name": choice.programme_name,
+                "department": choice.department,
+                "duration": choice.duration,
+                "category": choice.category
+            })
+        
+        print(f"✅ Found {len(choices_data)} programme choices")
+        
+        return {
+            "success": True,
+            "message": "Programme choices retrieved successfully",
+            "choices": choices_data
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching programme choices: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e),
+            "choices": []
+        }
 
 # ==================== APPLICANT SUBMISSIONS ENDPOINTS ====================
 
@@ -1589,7 +1746,7 @@ def get_applicant_submission(request, submission_id: int):
             return {
                 "success": False,
                 "message": "Submission not found"
-            }, 404
+            }
         
         user_obj = applicant.user
         
@@ -1678,14 +1835,14 @@ def update_submission_status(request, submission_id: int):
             return {
                 "success": False,
                 "message": "Status is required"
-            }, 400
+            }
         
         valid_statuses = ['submitted', 'pending', 'under_review', 'reviewed', 'accepted', 'approved', 'rejected']
         if new_status not in valid_statuses:
             return {
                 "success": False,
                 "message": f"Invalid status. Must be one of: {valid_statuses}"
-            }, 400
+            }
         
         try:
             applicant = Applicant.objects.get(id=submission_id)
@@ -1693,7 +1850,7 @@ def update_submission_status(request, submission_id: int):
             return {
                 "success": False,
                 "message": "Submission not found"
-            }, 404
+            }
         
         applicant.status = new_status
         applicant.save()
@@ -1712,7 +1869,7 @@ def update_submission_status(request, submission_id: int):
         return {
             "success": False,
             "message": str(e)
-        }, 400
+        }
 
 @router.patch("/applicant-submissions/{submission_id}/ml-prediction")
 @router.patch("/applicant-submissions/{submission_id}/ml-prediction/")
@@ -1732,7 +1889,7 @@ def update_ml_prediction(request, submission_id: int):
             return {
                 "success": False,
                 "message": "ML prediction data is required"
-            }, 400
+            }
         
         try:
             applicant = Applicant.objects.get(id=submission_id)
@@ -1740,7 +1897,7 @@ def update_ml_prediction(request, submission_id: int):
             return {
                 "success": False,
                 "message": "Submission not found"
-            }, 404
+            }
         
         print(f"✅ ML Prediction for {applicant.first_name} {applicant.last_name}:")
         print(f"   Decision: {ml_prediction.get('decision')}")
@@ -1762,7 +1919,7 @@ def update_ml_prediction(request, submission_id: int):
         return {
             "success": False,
             "message": f"Failed to save ML prediction: {str(e)}"
-        }, 400
+        }
 
 # ==================== APPLICANT MANAGEMENT ENDPOINTS ====================
 
@@ -1847,7 +2004,7 @@ def upload_documents(request, applicant_id: int):
         if 'msce' in request.FILES:
             msce_file = request.FILES['msce']
             if msce_file.size > 5 * 1024 * 1024:
-                return {"success": False, "message": "File size must be less than 5MB"}, 400
+                return {"success": False, "message": "File size must be less than 5MB"}
             
             ext = msce_file.name.split('.')[-1]
             filename = f"msce_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
@@ -1861,7 +2018,7 @@ def upload_documents(request, applicant_id: int):
         if 'id_card' in request.FILES:
             id_file = request.FILES['id_card']
             if id_file.size > 5 * 1024 * 1024:
-                return {"success": False, "message": "File size must be less than 5MB"}, 400
+                return {"success": False, "message": "File size must be less than 5MB"}
             
             ext = id_file.name.split('.')[-1]
             filename = f"id_card_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
@@ -1875,7 +2032,7 @@ def upload_documents(request, applicant_id: int):
         if 'payment_proof' in request.FILES:
             payment_file = request.FILES['payment_proof']
             if payment_file.size > 5 * 1024 * 1024:
-                return {"success": False, "message": "File size must be less than 5MB"}, 400
+                return {"success": False, "message": "File size must be less than 5MB"}
             
             ext = payment_file.name.split('.')[-1]
             filename = f"payment_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
@@ -1896,10 +2053,7 @@ def upload_documents(request, applicant_id: int):
         raise
     except Exception as e:
         print(f"Error uploading documents: {str(e)}")
-        return {"success": False, "message": f"Failed to upload: {str(e)}"}, 400
-
-
-# Add this GET endpoint after your POST /documents endpoint
+        return {"success": False, "message": f"Failed to upload: {str(e)}"}
 
 @router.get("/applicants/{applicant_id}/documents")
 @router.get("/applicants/{applicant_id}/documents/")
@@ -1914,7 +2068,7 @@ def get_documents(request, applicant_id: int):
             return {
                 "success": False,
                 "message": "Applicant not found"
-            }, 404
+            }
         
         result = {
             "msce": None,
@@ -1962,7 +2116,81 @@ def get_documents(request, applicant_id: int):
         return {
             "success": False,
             "message": f"Failed to get documents: {str(e)}"
-        }, 400
+        }
+
+@router.delete("/applicants/{applicant_id}/documents/{field}")
+@router.delete("/applicants/{applicant_id}/documents/{field}/")
+def delete_document(request, applicant_id: int, field: str):
+    """Delete a specific document for an applicant"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Validate the field name
+        valid_fields = ['msce', 'id_card', 'payment_proof']
+        if field not in valid_fields:
+            return {
+                "success": False,
+                "message": f"Invalid document field. Must be one of: {', '.join(valid_fields)}"
+            }
+        
+        try:
+            applicant = Applicant.objects.get(id=applicant_id, user=user)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Applicant not found"
+            }
+        
+        # Get the document path
+        docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant_id))
+        
+        if not os.path.exists(docs_dir):
+            return {
+                "success": False,
+                "message": "No documents found for this applicant"
+            }
+        
+        # Find and delete the file matching the field
+        deleted = False
+        deleted_filename = None
+        
+        for filename in os.listdir(docs_dir):
+            if filename.startswith(f"{field}_"):
+                filepath = os.path.join(docs_dir, filename)
+                try:
+                    os.remove(filepath)
+                    deleted = True
+                    deleted_filename = filename
+                    print(f"✅ Deleted {field} document: {filename}")
+                except Exception as e:
+                    print(f"Error deleting file: {e}")
+                    return {
+                        "success": False,
+                        "message": f"Error deleting file: {str(e)}"
+                    }
+                break
+        
+        if not deleted:
+            return {
+                "success": False,
+                "message": f"No {field} document found to delete"
+            }
+        
+        return {
+            "success": True,
+            "message": f"{field.replace('_', ' ').title()} document deleted successfully"
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting document: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to delete document: {str(e)}"
+        }
 
 # ==================== DASHBOARD STATS ENDPOINT ====================
 
@@ -1976,33 +2204,18 @@ def dashboard_stats(request):
         print(f"📊 Fetching dashboard stats for user {user.username}")
         
         total_applicants = Applicant.objects.count()
-        
         total_applications = Applicant.objects.exclude(
             selected_programme__isnull=True
         ).exclude(
             selected_programme_name__isnull=True
         ).count()
-        
-        fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees')
-        total_fees = 0
-        if os.path.exists(fees_dir):
-            for user_dir in os.listdir(fees_dir):
-                user_fees_dir = os.path.join(fees_dir, user_dir)
-                if os.path.isdir(user_fees_dir):
-                    files = os.listdir(user_fees_dir)
-                    if any(f.startswith('deposit_slip_') for f in files):
-                        total_fees += 25000
-        
         total_programmes = Programme.objects.count()
         
         stats_data = {
             "totalApplicants": total_applicants,
             "totalApplications": total_applications,
-            "totalFees": total_fees,
             "totalProgrammes": total_programmes
         }
-        
-        print(f"📊 Dashboard stats: {stats_data}")
         
         return {
             "success": True,
@@ -2020,110 +2233,9 @@ def dashboard_stats(request):
             "data": {
                 "totalApplicants": 0,
                 "totalApplications": 0,
-                "totalFees": 0,
                 "totalProgrammes": 0
             }
         }
-
-
-@router.patch("/application-fees/{fee_id}/status")
-@router.patch("/application-fees/{fee_id}/status/")
-def update_fee_status(request, fee_id: int):
-    """Update fee payment status"""
-    try:
-        user = get_user_from_token(request)
-        
-        body = json.loads(request.body)
-        new_status = body.get('status')
-        
-        if not new_status:
-            return {"success": False, "message": "Status is required"}, 400
-        
-        valid_statuses = ['pending', 'accepted', 'rejected', 'approved', 'processing']
-        if new_status not in valid_statuses:
-            return {"success": False, "message": f"Invalid status"}, 400
-        
-        try:
-            user_obj = User.objects.get(id=fee_id)
-        except User.DoesNotExist:
-            return {"success": False, "message": "User not found"}, 404
-        
-        # Update or create fee status
-        fee_status, created = FeeStatus.objects.get_or_create(user=user_obj)
-        fee_status.status = new_status
-        fee_status.save()
-        
-        return {
-            "success": True,
-            "message": f"Fee status updated to {new_status}",
-            "data": {"user_id": fee_id, "status": new_status}
-        }
-        
-    except Exception as e:
-        print(f"Error updating fee status: {str(e)}")
-        return {"success": False, "message": str(e)}, 400
-
-@router.get("/admin/fees", response={200: dict})
-@router.get("/admin/fees/", response={200: dict})
-def get_all_fees(request):
-    """Get all fee submissions for admin"""
-    try:
-        user = get_user_from_token(request)
-        
-        fees_list = []
-        
-        # Get all fee payments from the database
-        from .models import FeePayment
-        
-        fee_payments = FeePayment.objects.select_related('user').all().order_by('-uploaded_at')
-        
-        for fee_payment in fee_payments:
-            user_obj = fee_payment.user
-            
-            # Get applicant name
-            try:
-                applicant = Applicant.objects.get(user=user_obj)
-                applicant_name = f"{applicant.first_name} {applicant.last_name}".strip() or user_obj.username
-                programme = applicant.selected_programme_name or applicant.program or "Not specified"
-            except Applicant.DoesNotExist:
-                applicant_name = user_obj.username
-                programme = "Not specified"
-            
-            # Get fee status (use the status from FeePayment model)
-            status = fee_payment.status
-            
-            # Construct deposit slip URL
-            deposit_slip_url = None
-            if fee_payment.deposit_slip_path:
-                deposit_slip_url = f"/media/{fee_payment.deposit_slip_path}"
-            
-            fees_list.append({
-                "id": fee_payment.id,
-                "user_id": user_obj.id,
-                "applicant_name": applicant_name,
-                "programme": programme,
-                "amount": float(fee_payment.amount),
-                "status": status,
-                "deposit_slip": deposit_slip_url,
-                "paid_at": fee_payment.uploaded_at.isoformat() if fee_payment.uploaded_at else None,
-                "email": user_obj.email,
-            })
-        
-        return {
-            "success": True,
-            "message": f"Found {len(fees_list)} fee submissions",
-            "data": fees_list
-        }
-        
-    except Exception as e:
-        print(f"Error fetching fees: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return {
-            "success": False,
-            "message": str(e),
-            "data": []
-        }, 500
 
 # ==================== APPLICATION FEES SUBMISSION ENDPOINT ====================
 
@@ -2135,62 +2247,51 @@ def submit_application_fees(request):
         user = get_user_from_token(request)
         print(f"📝 Processing application fee for user {user.username}")
         
-        # Check if deposit slip is provided
         if 'deposit_slip' not in request.FILES:
             return {
                 "success": False,
                 "message": "Deposit slip is required"
-            }, 400
+            }
         
         deposit_slip = request.FILES['deposit_slip']
         
-        # Validate file type
         allowed_types = ['image/jpeg', 'image/jpg', 'image/png', 'application/pdf']
         if deposit_slip.content_type not in allowed_types:
             return {
                 "success": False,
                 "message": "Invalid file type. Please upload JPG, PNG, or PDF"
-            }, 400
+            }
         
-        # Validate file size (max 5MB)
         if deposit_slip.size > 5 * 1024 * 1024:
             return {
                 "success": False,
                 "message": "File size must be less than 5MB"
-            }, 400
+            }
         
-        # Create fees directory if it doesn't exist
         fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees', str(user.id))
         os.makedirs(fees_dir, exist_ok=True)
         
-        # Generate unique filename
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         ext = deposit_slip.name.split('.')[-1]
         filename = f"deposit_slip_{user.id}_{timestamp}.{ext}"
         filepath = os.path.join('fees', str(user.id), filename)
         
-        # Save the file
         saved_path = default_storage.save(filepath, ContentFile(deposit_slip.read()))
         
-        # Save to database using FeePayment model
         try:
-            from .models import FeePayment
             fee_payment, created = FeePayment.objects.get_or_create(user=user)
             fee_payment.deposit_slip_path = saved_path
             fee_payment.status = 'pending'
-            fee_payment.amount = 25000  # MWK 25,000 application fee
+            fee_payment.amount = 25000
             fee_payment.uploaded_at = datetime.now()
             fee_payment.save()
             print(f"✅ Saved to database: {fee_payment}")
         except Exception as db_error:
             print(f"⚠️ Database save error: {db_error}")
-            # Continue even if database save fails - file is saved
-        
-        print(f"✅ Deposit slip saved for user {user.username}: {saved_path}")
         
         return {
             "success": True,
-            "message": "Deposit slip submitted successfully! Your application is being processed.",
+            "message": "Deposit slip submitted successfully!",
             "data": {
                 "file_path": saved_path,
                 "file_name": deposit_slip.name,
@@ -2208,9 +2309,7 @@ def submit_application_fees(request):
         return {
             "success": False,
             "message": f"Failed to submit deposit slip: {str(e)}"
-        }, 400
-
-
+        }
 
 @router.get("/application-fees", response={200: dict, 401: dict})
 @router.get("/application-fees/", response={200: dict, 401: dict})
@@ -2220,9 +2319,7 @@ def get_application_fees(request):
         user = get_user_from_token(request)
         print(f"📝 Fetching application fee status for user {user.username}")
         
-        # Check database first
         try:
-            from .models import FeePayment
             fee_payment = FeePayment.objects.get(user=user)
             return {
                 "success": True,
@@ -2237,7 +2334,6 @@ def get_application_fees(request):
         except FeePayment.DoesNotExist:
             pass
         
-        # Check filesystem as fallback
         fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees', str(user.id))
         
         if os.path.exists(fees_dir):
@@ -2271,7 +2367,7 @@ def get_application_fees(request):
         return {
             "success": False,
             "message": f"Failed to fetch status: {str(e)}"
-        }, 400
+        }
 
 # ==================== GET SINGLE APPLICANT ENDPOINT ====================
 
@@ -2288,7 +2384,7 @@ def get_single_applicant(request, applicant_id: int):
             return {
                 "success": False,
                 "message": f"User with ID {applicant_id} not found"
-            }, 404
+            }
         
         try:
             applicant = Applicant.objects.get(user=user_obj)
@@ -2339,11 +2435,9 @@ def get_single_applicant(request, applicant_id: int):
         return {
             "success": False,
             "message": str(e)
-        }, 400
-
+        }
 
 # ==================== SUBMIT APPLICATION ENDPOINT ====================
-
 @router.post("/submit", response={200: dict, 400: dict, 401: dict, 409: dict})
 @router.post("/submit/", response={200: dict, 400: dict, 401: dict, 409: dict})
 def submit_application(request):
@@ -2352,7 +2446,6 @@ def submit_application(request):
         user = get_user_from_token(request)
         print(f"📝 Finalizing application for user {user.username}")
         
-        # Parse request body
         import json
         body = json.loads(request.body) if request.body else {}
         programme_id = body.get('programme_id')
@@ -2361,7 +2454,7 @@ def submit_application(request):
             return {
                 "success": False,
                 "message": "Programme ID is required"
-            }, 400
+            }
         
         try:
             applicant = Applicant.objects.get(user=user)
@@ -2369,11 +2462,10 @@ def submit_application(request):
             return {
                 "success": False,
                 "message": "Applicant profile not found. Please complete your profile first."
-            }, 404
+            }
         
         # Check if already submitted
         if applicant.status == 'submitted':
-            # Generate reference number if not exists
             if not hasattr(applicant, 'reference_number') or not applicant.reference_number:
                 applicant.reference_number = generate_reference_number(applicant.id)
                 applicant.save()
@@ -2390,58 +2482,18 @@ def submit_application(request):
                     "programme_name": applicant.selected_programme_name or applicant.program or "Not specified"
                 },
                 "email_sent": False
-            }, 409
+            }
         
-        # Check if all requirements are met
         missing_items = []
         
-        # Check personal details
         if not applicant.first_name or not applicant.last_name or not applicant.email:
             missing_items.append("Personal details")
         
-        # Check next of kin
         if not NextOfKin.objects.filter(user=user).exists():
             missing_items.append("Next of kin information")
         
-        # Check subject records
         if not SubjectRecord.objects.filter(user=user).exists():
             missing_items.append("Academic records")
-        
-        # Check selected programme
-        programme = None
-        if programme_id:
-            try:
-                programme = Programme.objects.get(id=programme_id)
-                applicant.selected_programme = programme
-                applicant.selected_programme_name = programme.name
-                applicant.selected_programme_id = programme.id
-                applicant.selected_programme_department = programme.department.name if programme.department else ""
-                applicant.selected_programme_duration = programme.duration
-                applicant.selected_programme_category = programme.category
-                applicant.selected_programme_code = programme.code
-                applicant.save()
-            except Programme.DoesNotExist:
-                missing_items.append("Valid programme selection")
-        else:
-            missing_items.append("Programme selection")
-        
-        # Check documents (optional - based on your requirements)
-        docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant.id))
-        has_documents = False
-        if os.path.exists(docs_dir):
-            files = os.listdir(docs_dir)
-            has_msce = any(f.startswith('msce_') for f in files)
-            has_id = any(f.startswith('id_card_') for f in files)
-            if has_msce and has_id:
-                has_documents = True
-        
-        # Check fee payment (optional - based on your requirements)
-        fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees', str(user.id))
-        has_fee = False
-        if os.path.exists(fees_dir):
-            files = os.listdir(fees_dir)
-            if any(f.startswith('deposit_slip_') for f in files):
-                has_fee = True
         
         if missing_items:
             return {
@@ -2450,13 +2502,10 @@ def submit_application(request):
                 "data": {
                     "missing_items": missing_items
                 }
-            }, 400
+            }
         
-        # Generate reference number
         reference_number = generate_reference_number(applicant.id)
         applicant.reference_number = reference_number
-        
-        # Update applicant status to submitted
         applicant.status = 'submitted'
         applicant.application_date = datetime.now()
         applicant.save()
@@ -2464,7 +2513,29 @@ def submit_application(request):
         print(f"✅ Application submitted successfully for user {user.username}")
         print(f"📋 Reference number: {reference_number}")
         
-        # Send confirmation email (optional)
+        # ========== CREATE NOTIFICATION ==========
+        try:
+            from .models import Notification
+            
+            # Create notification for application submission
+            notification_title = "Application Submitted Successfully"
+            notification_message = f"Your application has been submitted successfully. Reference Number: {reference_number}. We will notify you once it's reviewed."
+            notification_link = "/dashboard/my-applications"
+            
+            Notification.objects.create(
+                user=user,
+                title=notification_title,
+                message=notification_message,
+                notification_type="application",
+                is_read=False,
+                link=notification_link
+            )
+            print(f"✅ Notification created for user {user.username}")
+            
+        except Exception as notif_error:
+            print(f"⚠️ Could not create notification: {notif_error}")
+        # ========================================
+        
         email_sent = False
         try:
             email_sent = send_application_confirmation_email(
@@ -2499,9 +2570,7 @@ def submit_application(request):
         return {
             "success": False,
             "message": f"Failed to submit application: {str(e)}"
-        }, 400
-
-
+        }
 # ==================== SUBMISSION STATUS ENDPOINT ====================
 
 @router.get("/submit/status", response={200: dict, 401: dict})
@@ -2513,7 +2582,6 @@ def get_submission_status(request):
         
         try:
             applicant = Applicant.objects.get(user=user)
-            
             is_submitted = applicant.status == 'submitted'
             reference_number = getattr(applicant, 'reference_number', None)
             
@@ -2546,8 +2614,7 @@ def get_submission_status(request):
         return {
             "success": False,
             "message": str(e)
-        }, 400
-
+        }
 
 # Helper function to generate reference number
 def generate_reference_number(applicant_id):
@@ -2562,8 +2629,7 @@ def generate_reference_number(applicant_id):
     
     return f"{prefix}/{year}/{month}/{day}/{random_num}-{timestamp}"
 
-
-# Email helper function (add if not already present)
+# Email helper function
 def send_application_confirmation_email(user_email, user_name, reference_number, programme_name):
     """Send application confirmation email to applicant"""
     try:
@@ -2593,9 +2659,9 @@ def send_application_confirmation_email(user_email, user_name, reference_number,
                     <p>Thank you for submitting your application. We have successfully received your application for the <strong>{programme_name}</strong> programme.</p>
                     
                     <div class="reference">
-                        <p style="margin-bottom: 10px;">Your Application Reference Number:</p>
+                        <p>Your Application Reference Number:</p>
                         <div class="reference-number">{reference_number}</div>
-                        <p style="margin-top: 10px; font-size: 14px;">Please keep this number for future reference</p>
+                        <p>Please keep this number for future reference</p>
                     </div>
                     
                     <h3>Next Steps:</h3>
@@ -2605,8 +2671,6 @@ def send_application_confirmation_email(user_email, user_name, reference_number,
                         <li>Please check your application portal regularly for updates</li>
                         <li>Use your reference number for any inquiries</li>
                     </ol>
-                    
-                    <p>If you have any questions, please contact our admissions office.</p>
                     
                     <p>Best regards,<br>
                     <strong>Admissions Office</strong></p>
@@ -2624,17 +2688,11 @@ def send_application_confirmation_email(user_email, user_name, reference_number,
         
         Dear {user_name},
         
-        Thank you for submitting your application. We have successfully received your application for the {programme_name} programme.
+        Thank you for submitting your application for the {programme_name} programme.
         
         Your Application Reference Number: {reference_number}
         
         Please keep this number for future reference.
-        
-        Next Steps:
-        1. Your application will be reviewed by the admissions committee
-        2. You will receive updates via email regarding your application status
-        3. Please check your application portal regularly for updates
-        4. Use your reference number for any inquiries
         
         Best regards,
         Admissions Office
@@ -2652,7 +2710,6 @@ def send_application_confirmation_email(user_email, user_name, reference_number,
     except Exception as e:
         print(f"Error sending email: {str(e)}")
         return False
-
 
 # ==================== COMMITTEE MANAGEMENT ENDPOINTS ====================
 
@@ -2673,7 +2730,6 @@ class CommitteeMemberUpdateSchema(Schema):
     bio: Optional[str] = None
     is_active: Optional[bool] = None
 
-# REMOVE the response decorators - let them return directly
 @router.get("/committee/members")
 @router.get("/committee/members/")
 def get_committee_members(request):
@@ -2733,7 +2789,7 @@ def get_committee_member(request, member_id: int):
             return {
                 "success": False,
                 "message": f"Committee member with ID {member_id} not found"
-            }, 404
+            }
         
         return {
             "success": True,
@@ -2773,7 +2829,7 @@ def create_committee_member(request, data: CommitteeMemberSchema):
             return {
                 "success": False,
                 "message": f"Committee member with email {data.email} already exists"
-            }, 400
+            }
         
         member = CommitteeMember.objects.create(
             name=data.name,
@@ -2825,7 +2881,7 @@ def update_committee_member(request, member_id: int, data: CommitteeMemberUpdate
             return {
                 "success": False,
                 "message": f"Committee member with ID {member_id} not found"
-            }, 404
+            }
         
         if data.name is not None:
             member.name = data.name
@@ -2836,7 +2892,7 @@ def update_committee_member(request, member_id: int, data: CommitteeMemberUpdate
                 return {
                     "success": False,
                     "message": f"Committee member with email {data.email} already exists"
-                }, 400
+                }
             member.email = data.email
         if data.phone is not None:
             member.phone = data.phone
@@ -2889,7 +2945,7 @@ def delete_committee_member(request, member_id: int):
             return {
                 "success": False,
                 "message": f"Committee member with ID {member_id} not found"
-            }, 404
+            }
         
         member_name = member.name
         member.delete()
@@ -2923,7 +2979,7 @@ def reorder_committee_members(request):
             return {
                 "success": False,
                 "message": "Member IDs are required"
-            }, 400
+            }
         
         from .models import CommitteeMember
         
@@ -2947,6 +3003,222 @@ def reorder_committee_members(request):
             "message": str(e)
         }
 
+# ==================== NOTIFICATION ENDPOINTS ====================
+
+def get_time_ago(dt):
+    """Convert datetime to 'X minutes/hours/days ago' string"""
+    if not dt:
+        return "recent"
+    
+    from django.utils import timezone
+    now = timezone.now()
+    diff = now - dt
+    
+    if diff.days > 7:
+        return dt.strftime("%b %d, %Y")
+    elif diff.days > 0:
+        return f"{diff.days} day{'s' if diff.days > 1 else ''} ago"
+    elif diff.seconds > 3600:
+        hours = diff.seconds // 3600
+        return f"{hours} hour{'s' if hours > 1 else ''} ago"
+    elif diff.seconds > 60:
+        minutes = diff.seconds // 60
+        return f"{minutes} minute{'s' if minutes > 1 else ''} ago"
+    else:
+        return "just now"
+
+def create_notification(user, title, message, notification_type='info', link=None):
+    """Create a notification for a user"""
+    try:
+        from .models import Notification
+        
+        notification = Notification.objects.create(
+            user=user,
+            title=title,
+            message=message,
+            notification_type=notification_type,
+            link=link
+        )
+        return notification
+    except Exception as e:
+        print(f"Error creating notification: {str(e)}")
+        return None
+
+@router.get("/notifications", response={200: dict, 401: dict})
+@router.get("/notifications/", response={200: dict, 401: dict})
+def get_notifications(request):
+    """Get all notifications for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Notification
+        
+        notifications = Notification.objects.filter(user=user).order_by('-created_at')[:20]
+        
+        notifications_data = []
+        for notif in notifications:
+            notifications_data.append({
+                "id": notif.id,
+                "title": notif.title,
+                "message": notif.message,
+                "notification_type": notif.notification_type,
+                "is_read": notif.is_read,
+                "link": notif.link,
+                "created_at": notif.created_at.isoformat() if notif.created_at else None,
+                "time_ago": get_time_ago(notif.created_at) if notif.created_at else "recent"
+            })
+        
+        unread_count = Notification.objects.filter(user=user, is_read=False).count()
+        
+        return {
+            "success": True,
+            "message": "Notifications retrieved successfully",
+            "data": notifications_data,
+            "unread_count": unread_count
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching notifications: {str(e)}")
+        return {
+            "success": True,
+            "message": "No notifications found",
+            "data": [],
+            "unread_count": 0
+        }
+
+@router.get("/notifications/unread/count", response={200: dict, 401: dict})
+@router.get("/notifications/unread/count/", response={200: dict, 401: dict})
+def get_unread_notifications_count(request):
+    """Get count of unread notifications"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Notification
+        
+        unread_count = Notification.objects.filter(user=user, is_read=False).count()
+        
+        return {
+            "success": True,
+            "count": unread_count
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching unread count: {str(e)}")
+        return {
+            "success": True,
+            "count": 0
+        }
+
+@router.put("/notifications/{notification_id}/read", response={200: dict, 401: dict, 404: dict})
+@router.put("/notifications/{notification_id}/read/", response={200: dict, 401: dict, 404: dict})
+def mark_notification_as_read(request, notification_id: int):
+    """Mark a specific notification as read"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Notification
+        
+        try:
+            notification = Notification.objects.get(id=notification_id, user=user)
+            notification.is_read = True
+            notification.save()
+            
+            return {
+                "success": True,
+                "message": "Notification marked as read"
+            }
+        except Notification.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Notification not found"
+            }
+            
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error marking notification as read: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@router.put("/notifications/read-all", response={200: dict, 401: dict})
+@router.put("/notifications/read-all/", response={200: dict, 401: dict})
+def mark_all_notifications_as_read(request):
+    """Mark all notifications as read for the user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Notification
+        
+        updated_count = Notification.objects.filter(user=user, is_read=False).update(is_read=True)
+        
+        return {
+            "success": True,
+            "message": f"Marked {updated_count} notifications as read",
+            "updated_count": updated_count
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error marking all as read: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@router.post("/notifications", response={200: dict, 401: dict})
+@router.post("/notifications/", response={200: dict, 401: dict})
+def create_notification_endpoint(request):
+    """Create a notification (for internal use)"""
+    try:
+        user = get_user_from_token(request)
+        
+        import json
+        body = json.loads(request.body) if request.body else {}
+        
+        title = body.get('title')
+        message = body.get('message')
+        notification_type = body.get('notification_type', 'info')
+        link = body.get('link')
+        
+        if not title or not message:
+            return {
+                "success": False,
+                "message": "Title and message are required"
+            }
+        
+        notification = create_notification(
+            user=user,
+            title=title,
+            message=message,
+            notification_type=notification_type,
+            link=link
+        )
+        
+        return {
+            "success": True,
+            "message": "Notification created successfully",
+            "data": {
+                "id": notification.id,
+                "title": notification.title,
+                "message": notification.message
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating notification: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
 
 # ==================== PASSWORD RESET WITH OTP ====================
 
@@ -2974,26 +3246,20 @@ def send_password_reset_otp(request, data: PasswordResetOTPSchema):
     try:
         email = data.email
         
-        # Check if user exists
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
-            # Don't reveal that user doesn't exist for security
             return {
                 "success": True,
                 "message": "If an account exists, an OTP has been sent."
             }
         
-        # Generate 6-digit OTP
         otp = f"{random.randint(100000, 999999)}"
-        
-        # Store OTP in cache with 10-minute expiry
         cache_key = f"password_reset_otp_{email}"
-        cache.set(cache_key, otp, timeout=600)  # 10 minutes
+        cache.set(cache_key, otp, timeout=600)
         
-        print(f"OTP for {email}: {otp}")  # For debugging
+        print(f"OTP for {email}: {otp}")
         
-        # Send email with OTP
         html_message = f"""
         <!DOCTYPE html>
         <html>
@@ -3003,7 +3269,6 @@ def send_password_reset_otp(request, data: PasswordResetOTPSchema):
                 .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
                 .header {{ background: linear-gradient(135deg, #059669, #047857); color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }}
                 .otp {{ font-size: 32px; font-weight: bold; color: #059669; text-align: center; padding: 20px; letter-spacing: 5px; }}
-                .footer {{ text-align: center; padding: 20px; font-size: 12px; color: #6b7280; }}
             </style>
         </head>
         <body>
@@ -3013,13 +3278,8 @@ def send_password_reset_otp(request, data: PasswordResetOTPSchema):
                 </div>
                 <div class="content" style="padding: 20px;">
                     <p>Hello {user.username},</p>
-                    <p>You requested to reset your password. Use the following OTP to verify your identity:</p>
-                    <div class="otp">{otp}</div>
+                    <p>Your OTP is: <strong style="font-size: 24px;">{otp}</strong></p>
                     <p>This OTP will expire in 10 minutes.</p>
-                    <p>If you didn't request this, please ignore this email.</p>
-                </div>
-                <div class="footer">
-                    <p>&copy; 2024 Mzuzu University. All rights reserved.</p>
                 </div>
             </div>
         </body>
@@ -3028,7 +3288,7 @@ def send_password_reset_otp(request, data: PasswordResetOTPSchema):
         
         send_mail(
             'Password Reset OTP',
-            f'Your OTP for password reset is: {otp}. This OTP will expire in 10 minutes.',
+            f'Your OTP for password reset is: {otp}. Valid for 10 minutes.',
             settings.DEFAULT_FROM_EMAIL,
             [email],
             fail_silently=False,
@@ -3070,15 +3330,12 @@ def verify_password_reset_otp(request, data: VerifyOTPSchema):
                 "message": "Invalid OTP. Please try again."
             }
         
-        # Generate reset token
         import uuid
         reset_token = str(uuid.uuid4())
         
-        # Store reset token with 1-hour expiry
         token_cache_key = f"password_reset_token_{reset_token}"
-        cache.set(token_cache_key, email, timeout=3600)  # 1 hour
+        cache.set(token_cache_key, email, timeout=3600)
         
-        # Clear OTP cache
         cache.delete(cache_key)
         
         return {
@@ -3116,7 +3373,6 @@ def password_reset_confirm(request, data: PasswordResetConfirmSchema):
                 "message": "Password must be at least 8 characters"
             }
         
-        # Verify reset token
         token_cache_key = f"password_reset_token_{token}"
         stored_email = cache.get(token_cache_key)
         
@@ -3126,26 +3382,22 @@ def password_reset_confirm(request, data: PasswordResetConfirmSchema):
                 "message": "Invalid or expired reset link. Please request a new one."
             }
         
-        # Update user password
         try:
             user = User.objects.get(email=email)
             user.set_password(new_password)
             user.save()
-            
-            # Clear the token
             cache.delete(token_cache_key)
             
             return {
                 "success": True,
                 "message": "Password has been reset successfully. Please login with your new password."
             }
-            
         except User.DoesNotExist:
             return {
                 "success": False,
                 "message": "User not found."
             }
-            
+        
     except Exception as e:
         print(f"Password reset confirm error: {str(e)}")
         return {
@@ -3154,7 +3406,184 @@ def password_reset_confirm(request, data: PasswordResetConfirmSchema):
         }
 
 
+# Add this schema with your other schemas
+class EducationSchema(Schema):
+    qualification_type: str
+    institution: str
+    start_date: str
+    end_date: Optional[str] = None
+    currently_studying: bool = False
+
+# Add these education endpoints after your other endpoints (before the final api.add_router lines)
+
+# ==================== EDUCATION ENDPOINTS ====================
+
+@router.get("/education", response={200: dict, 401: dict})
+@router.get("/education/", response={200: dict, 401: dict})
+def get_education(request):
+    """Get all education records for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Get education records from database
+        # Assuming you have an Education model, or create one
+        from .models import Education
+        
+        records = Education.objects.filter(user=user).order_by('-start_date')
+        
+        data = []
+        for record in records:
+            data.append({
+                "id": record.id,
+                "qualification_type": record.qualification_type,
+                "institution": record.institution,
+                "start_date": record.start_date.isoformat() if record.start_date else None,
+                "end_date": record.end_date.isoformat() if record.end_date else None,
+                "currently_studying": record.currently_studying,
+            })
+        
+        return {
+            "success": True,
+            "message": "Education records retrieved successfully",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching education: {str(e)}")
+        return {
+            "success": True,
+            "message": "No education records found",
+            "data": [],
+            "count": 0
+        }
+
+
+@router.post("/education", response={200: dict, 401: dict})
+@router.post("/education/", response={200: dict, 401: dict})
+def create_education(request, data: EducationSchema):
+    """Create a new education record"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Education
+        
+        record = Education.objects.create(
+            user=user,
+            qualification_type=data.qualification_type,
+            institution=data.institution,
+            start_date=data.start_date,
+            end_date=data.end_date if not data.currently_studying else None,
+            currently_studying=data.currently_studying,
+        )
+        
+        return {
+            "success": True,
+            "message": "Education record created successfully",
+            "data": {
+                "id": record.id,
+                "qualification_type": record.qualification_type,
+                "institution": record.institution,
+                "start_date": record.start_date.isoformat() if record.start_date else None,
+                "end_date": record.end_date.isoformat() if record.end_date else None,
+                "currently_studying": record.currently_studying,
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating education: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to create education record: {str(e)}"
+        }
+
+
+@router.put("/education/{record_id}", response={200: dict, 401: dict, 404: dict})
+@router.put("/education/{record_id}/", response={200: dict, 401: dict, 404: dict})
+def update_education(request, record_id: int, data: EducationSchema):
+    """Update an education record"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Education
+        
+        try:
+            record = Education.objects.get(id=record_id, user=user)
+        except Education.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Education record not found"
+            }
+        
+        record.qualification_type = data.qualification_type
+        record.institution = data.institution
+        record.start_date = data.start_date
+        record.end_date = data.end_date if not data.currently_studying else None
+        record.currently_studying = data.currently_studying
+        record.save()
+        
+        return {
+            "success": True,
+            "message": "Education record updated successfully",
+            "data": {
+                "id": record.id,
+                "qualification_type": record.qualification_type,
+                "institution": record.institution,
+                "start_date": record.start_date.isoformat() if record.start_date else None,
+                "end_date": record.end_date.isoformat() if record.end_date else None,
+                "currently_studying": record.currently_studying,
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating education: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to update education record: {str(e)}"
+        }
+
+
+@router.delete("/education/{record_id}", response={200: dict, 401: dict, 404: dict})
+@router.delete("/education/{record_id}/", response={200: dict, 401: dict, 404: dict})
+def delete_education(request, record_id: int):
+    """Delete an education record"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Education
+        
+        try:
+            record = Education.objects.get(id=record_id, user=user)
+        except Education.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Education record not found"
+            }
+        
+        record.delete()
+        
+        return {
+            "success": True,
+            "message": "Education record deleted successfully",
+            "data": None
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting education: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to delete education record: {str(e)}"
+        }
 
         
-# Add router to API
+
+api.add_router("/ml", ml_router)
 api.add_router("/", router)
