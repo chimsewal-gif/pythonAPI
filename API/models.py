@@ -1,5 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import User
+from django.utils import timezone
 
 # Item model - Keep only one instance
 class Item(models.Model):
@@ -29,7 +30,7 @@ class Department(models.Model):
         db_table = 'departments'
         ordering = ['name']
 
-# Applicant model - Keep only one instance with updated fields
+# Applicant model - Keep only one instance with updated fields including document fields and ML fields
 class Applicant(models.Model):
     STATUS_CHOICES = [
         ('pending', 'Pending'),
@@ -70,9 +71,22 @@ class Applicant(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     application_date = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    reference_number = models.CharField(max_length=100, blank=True, null=True, unique=True)
     
-    # ========== PROGRAMME SELECTION FIELDS ==========
-    # Django automatically creates 'selected_programme_id' field - DO NOT add it manually
+    # Document fields
+    msce = models.CharField(max_length=500, blank=True, null=True)
+    msce_size = models.IntegerField(blank=True, null=True)
+    msce_name = models.CharField(max_length=255, blank=True, null=True)
+    
+    id_card = models.CharField(max_length=500, blank=True, null=True)
+    id_card_size = models.IntegerField(blank=True, null=True)
+    id_card_name = models.CharField(max_length=255, blank=True, null=True)
+    
+    payment_proof = models.CharField(max_length=500, blank=True, null=True)
+    payment_proof_size = models.IntegerField(blank=True, null=True)
+    payment_proof_name = models.CharField(max_length=255, blank=True, null=True)
+    
+    # Programme selection fields
     selected_programme = models.ForeignKey(
         'Programme', 
         on_delete=models.SET_NULL, 
@@ -80,13 +94,63 @@ class Applicant(models.Model):
         blank=True, 
         related_name='selected_by_applicants'
     )
-    # Store additional programme info as backup
     selected_programme_name = models.CharField(max_length=255, blank=True, null=True)
     selected_programme_department = models.CharField(max_length=255, blank=True, null=True)
     selected_programme_duration = models.CharField(max_length=100, blank=True, null=True)
     selected_programme_category = models.CharField(max_length=100, blank=True, null=True)
     selected_programme_code = models.CharField(max_length=50, blank=True, null=True)
-    selection_date = models.DateTimeField(auto_now_add=True, null=True)
+    selection_date = models.DateTimeField(default=timezone.now, null=True)
+    
+    # ========== ML PREDICTION FIELDS ==========
+    ml_decision = models.CharField(
+        max_length=50, 
+        blank=True, 
+        null=True,
+        help_text="ML decision: 'approve', 'reject', or 'review'"
+    )
+    ml_confidence = models.FloatField(
+        blank=True, 
+        null=True,
+        help_text="ML confidence score (0.0 to 1.0)"
+    )
+    ml_probability = models.FloatField(
+        blank=True, 
+        null=True,
+        help_text="Success probability (0.0 to 1.0)"
+    )
+    ml_priority = models.CharField(
+        max_length=20, 
+        blank=True, 
+        null=True,
+        help_text="Priority level: 'High', 'Medium', or 'Low'"
+    )
+    ml_factors = models.JSONField(
+        blank=True, 
+        null=True,
+        help_text="JSON object storing reasons and risk factors"
+    )
+    ml_recommendation = models.TextField(
+        blank=True, 
+        null=True,
+        help_text="ML recommendation text"
+    )
+    ml_processed_at = models.DateTimeField(
+        blank=True, 
+        null=True,
+        help_text="Timestamp when ML analysis was performed"
+    )
+    ml_raw_response = models.JSONField(
+        blank=True, 
+        null=True,
+        help_text="Complete raw ML response JSON"
+    )
+    # ========================================
+    
+    def save(self, *args, **kwargs):
+        # Ensure selection_date is timezone-aware when saving
+        if self.selection_date and timezone.is_naive(self.selection_date):
+            self.selection_date = timezone.make_aware(self.selection_date, timezone.get_current_timezone())
+        super().save(*args, **kwargs)
     
     def __str__(self):
         return f"{self.first_name} {self.last_name}"
@@ -94,7 +158,7 @@ class Applicant(models.Model):
     class Meta:
         db_table = 'applicants'
 
-# NEXT OF KIN MODEL
+# Next of Kin Model
 class NextOfKin(models.Model):
     TITLE_CHOICES = [
         ('Mr', 'Mr'),
@@ -137,7 +201,7 @@ class NextOfKin(models.Model):
         verbose_name_plural = "Next of Kin"
         ordering = ['-created_at']
 
-# Programme model
+# Programme model - Updated with study_mode and programme_type fields
 class Programme(models.Model):
     CATEGORY_CHOICES = [
         ('undergraduate', 'Undergraduate'),
@@ -146,12 +210,44 @@ class Programme(models.Model):
         ('certificate', 'Certificate'),
     ]
     
+    STUDY_MODE_CHOICES = [
+        ('full time', 'Full Time'),
+        ('weekend', 'Weekend'),
+        ('evening', 'Evening'),
+        ('online', 'Online'),
+        ('odel', 'ODeL'),
+    ]
+    
+    PROGRAMME_TYPE_CHOICES = [
+        ('upgrading', 'Upgrading'),
+        ('non-generic', 'Non-Generic'),
+        ('generic', 'Generic'),
+    ]
+    
     name = models.CharField(max_length=200)
     code = models.CharField(max_length=20, unique=True, blank=True, null=True)
     description = models.TextField(blank=True, null=True)
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='programmes')
+    school = models.CharField(max_length=200, blank=True, null=True, help_text="School/Faculty offering the programme")
     duration = models.CharField(max_length=50, blank=True, null=True)
     category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='undergraduate')
+    
+    # Fields for type column display
+    study_mode = models.CharField(
+        max_length=20, 
+        choices=STUDY_MODE_CHOICES, 
+        blank=True, 
+        null=True,
+        help_text="Study mode: full time, weekend, evening, online, or odel"
+    )
+    programme_type = models.CharField(
+        max_length=20, 
+        choices=PROGRAMME_TYPE_CHOICES, 
+        blank=True, 
+        null=True,
+        help_text="Type of programme: upgrading, non-generic, or generic"
+    )
+    
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -263,7 +359,6 @@ class SubjectRecord(models.Model):
         db_table = 'subject_records'
         ordering = ['-year', 'subject']
 
-
 class CommitteeMember(models.Model):
     name = models.CharField(max_length=200)
     role = models.CharField(max_length=100)
@@ -284,8 +379,6 @@ class CommitteeMember(models.Model):
         db_table = 'committee_members'
         ordering = ['order', 'name']
 
-# models.py - Add this model
-
 class Notification(models.Model):
     NOTIFICATION_TYPES = [
         ('application', 'Application Update'),
@@ -293,6 +386,8 @@ class Notification(models.Model):
         ('system', 'System Notification'),
         ('reminder', 'Reminder'),
         ('info', 'Information'),
+        ('success', 'Success'),
+        ('warning', 'Warning'),
     ]
     
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
@@ -305,6 +400,7 @@ class Notification(models.Model):
     
     class Meta:
         ordering = ['-created_at']
+        db_table = 'notifications'
     
     def __str__(self):
         return f"{self.title} - {self.user.username}"
@@ -321,20 +417,18 @@ class ProgrammeChoice(models.Model):
     
     class Meta:
         ordering = ['choice_number']
+        db_table = 'programme_choices'
         unique_together = ['user', 'choice_number']
     
     def __str__(self):
         return f"{self.user.username} - Choice {self.choice_number}: {self.programme_name}"
 
-# Django model example
 class Document(models.Model):
     applicant = models.ForeignKey(Applicant, on_delete=models.CASCADE)
     document_name = models.CharField(max_length=255)
     document_type = models.CharField(max_length=100)
     file = models.FileField(upload_to='documents/')
     uploaded_at = models.DateTimeField(auto_now_add=True)
-
-# Add this model to your models.py
 
 class Education(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='education_records')
@@ -352,6 +446,7 @@ class Education(models.Model):
     class Meta:
         db_table = 'education'
         ordering = ['-start_date']
+
 class WorkHistory(models.Model):
     EMPLOYMENT_TYPE_CHOICES = [
         ('Full-time', 'Full-time'),
@@ -391,6 +486,7 @@ class WorkHistory(models.Model):
         ordering = ['-start_date']
         verbose_name = 'Work History'
         verbose_name_plural = 'Work History'
+
 class Publication(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='publications')
     title = models.CharField(max_length=500)
@@ -425,8 +521,6 @@ class Essay(models.Model):
         db_table = 'essays'
         verbose_name = 'Essay'
         verbose_name_plural = 'Essays'
-
-# Add this to your models.py file with the other models
 
 class Referee(models.Model):
     TITLE_CHOICES = [
@@ -478,3 +572,146 @@ class Referee(models.Model):
         ordering = ['-created_at']
         verbose_name = 'Referee'
         verbose_name_plural = 'Referees'
+
+
+# ==================== SETTINGS MODELS ====================
+
+class NotificationPreference(models.Model):
+    """Store user notification preferences"""
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='notification_preferences')
+    email_notifications = models.BooleanField(default=True)
+    application_updates = models.BooleanField(default=True)
+    deadline_reminders = models.BooleanField(default=True)
+    promotional_emails = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'notification_preferences'
+        verbose_name = 'Notification Preference'
+        verbose_name_plural = 'Notification Preferences'
+    
+    def __str__(self):
+        return f"{self.user.username}'s preferences"
+
+
+class UserSession(models.Model):
+    """Track user sessions"""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sessions')
+    session_key = models.CharField(max_length=255)
+    device_info = models.TextField(blank=True, null=True)
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    user_agent = models.TextField(blank=True, null=True)
+    last_activity = models.DateTimeField(default=timezone.now)
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        db_table = 'user_sessions'
+        verbose_name = 'User Session'
+        verbose_name_plural = 'User Sessions'
+        ordering = ['-last_activity']
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.session_key[:20]}"
+
+
+class PasswordResetToken(models.Model):
+    """Store password reset tokens"""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reset_tokens')
+    token = models.CharField(max_length=255, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    is_used = models.BooleanField(default=False)
+    
+    class Meta:
+        db_table = 'password_reset_tokens'
+    
+    def __str__(self):
+        return f"Reset token for {self.user.username}"
+    
+    def is_valid(self):
+        return not self.is_used and self.expires_at > timezone.now()
+
+
+class UserActivityLog(models.Model):
+    """Log user activities for security"""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='activity_logs')
+    action = models.CharField(max_length=100)
+    details = models.TextField(blank=True, null=True)
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    user_agent = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'user_activity_logs'
+        verbose_name = 'User Activity Log'
+        verbose_name_plural = 'User Activity Logs'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.user.username} - {self.action} - {self.created_at}"
+
+
+class UserProfileSettings(models.Model):
+    """Store user profile settings (theme, font size, etc.)"""
+    THEME_CHOICES = [
+        ('light', 'Light'),
+        ('dark', 'Dark'),
+        ('system', 'System'),
+    ]
+    
+    FONT_SIZE_CHOICES = [
+        ('small', 'Small'),
+        ('medium', 'Medium'),
+        ('large', 'Large'),
+    ]
+    
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile_settings')
+    theme = models.CharField(max_length=20, choices=THEME_CHOICES, default='light')
+    font_size = models.CharField(max_length=20, choices=FONT_SIZE_CHOICES, default='medium')
+    language = models.CharField(max_length=10, default='en')
+    timezone = models.CharField(max_length=50, default='UTC')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'user_profile_settings'
+        verbose_name = 'User Profile Setting'
+        verbose_name_plural = 'User Profile Settings'
+    
+    def __str__(self):
+        return f"{self.user.username}'s settings"
+
+
+class AuditLog(models.Model):
+    """Audit log for sensitive actions"""
+    ACTION_CHOICES = [
+        ('login', 'Login'),
+        ('logout', 'Logout'),
+        ('password_change', 'Password Change'),
+        ('profile_update', 'Profile Update'),
+        ('account_deletion', 'Account Deletion'),
+        ('session_logout', 'Session Logout'),
+        ('settings_update', 'Settings Update'),
+        ('data_export', 'Data Export'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='audit_logs')
+    action = models.CharField(max_length=100, choices=ACTION_CHOICES)
+    resource_type = models.CharField(max_length=100, blank=True, null=True)
+    resource_id = models.IntegerField(blank=True, null=True)
+    old_value = models.TextField(blank=True, null=True)
+    new_value = models.TextField(blank=True, null=True)
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    user_agent = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'audit_logs'
+        verbose_name = 'Audit Log'
+        verbose_name_plural = 'Audit Logs'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.user.username if self.user else 'Anonymous'} - {self.action} - {self.created_at}"

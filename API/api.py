@@ -15,6 +15,8 @@ from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 from .ml.endpoints import ml_router
 
+from django.http import FileResponse
+
 from datetime import datetime, timedelta, timezone
 from .models import (
     Applicant, 
@@ -286,6 +288,8 @@ def register_applicant(request, data: ApplicantRegistrationSchema):
         print(f"Registration error: {str(e)}")
         return {"success": False, "message": f"Registration failed: {str(e)}"}
 
+
+
 @router.get("/me", response={200: dict, 401: dict})
 @router.get("/me/", response={200: dict, 401: dict})
 def get_current_user(request):
@@ -312,6 +316,110 @@ def get_current_user(request):
     except Exception as e:
         print(f"Error getting current user: {str(e)}")
         raise HttpError(401, f"Authentication error: {str(e)}")
+
+
+# Add this schema class with your other schemas
+class UserUpdateSchema(Schema):
+    first_name: str
+    last_name: str
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    date_of_birth: Optional[str] = None
+
+# Add this endpoint after your GET /me endpoint
+@router.put("/me", response={200: dict, 400: dict, 401: dict})
+@router.put("/me/", response={200: dict, 400: dict, 401: dict})
+def update_current_user(request, data: UserUpdateSchema):
+    """Update current user's profile information"""
+    try:
+        user = get_user_from_token(request)
+        print(f"📝 Updating user profile for {user.username}")
+        print(f"Received data: {data.dict()}")
+        
+        # Update User model fields
+        user.first_name = data.first_name
+        user.last_name = data.last_name
+        user.save()
+        
+        # Update or create Applicant profile
+        try:
+            applicant = Applicant.objects.get(user=user)
+        except Applicant.DoesNotExist:
+            applicant = Applicant.objects.create(
+                user=user,
+                first_name=data.first_name,
+                last_name=data.last_name,
+                email=user.email,
+                status='pending'
+            )
+        
+        # Update Applicant fields
+        applicant.first_name = data.first_name
+        applicant.last_name = data.last_name
+        applicant.phone = data.phone or ""
+        
+        if data.address:
+            applicant.physical_address = data.address
+        
+        if data.date_of_birth:
+            applicant.date_of_birth = data.date_of_birth
+        
+        applicant.save()
+        
+        # Log the activity
+        from .models import UserActivityLog, AuditLog
+        UserActivityLog.objects.create(
+            user=user,
+            action="profile_updated",
+            details="User profile information updated",
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        AuditLog.objects.create(
+            user=user,
+            action="profile_update",
+            resource_type="User",
+            resource_id=user.id,
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        # Get the updated role
+        try:
+            role = applicant.program or 'guest'
+        except:
+            role = 'guest'
+        
+        return {
+            "success": True,
+            "message": "Profile updated successfully",
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "username": user.username,
+                "role": role,
+                "phone": applicant.phone,
+                "address": applicant.physical_address,
+                "date_of_birth": applicant.date_of_birth
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating user: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to update profile: {str(e)}"
+        }
+
+
+        
 
 @router.post("/logout", response={200: dict})
 @router.post("/logout/", response={200: dict})
@@ -1678,11 +1786,10 @@ def get_programme_choices(request):
         }
 
 # ==================== APPLICANT SUBMISSIONS ENDPOINTS ====================
-
 @router.get("/applicant-submissions", response={200: dict})
 @router.get("/applicant-submissions/", response={200: dict})
 def get_applicant_submissions(request):
-    """Get all applicant submissions for admin"""
+    """Get all applicant submissions for admin with ML data from database"""
     try:
         user = get_user_from_token(request)
         
@@ -1700,7 +1807,20 @@ def get_applicant_submissions(request):
             if not programme_name:
                 programme_name = applicant.program or "Not specified"
             
-            reference_number = f"APP-{applicant.id:06d}-{applicant.application_date.strftime('%Y') if applicant.application_date else '2024'}"
+            reference_number = applicant.reference_number or f"APP-{applicant.id:06d}-{applicant.application_date.strftime('%Y') if applicant.application_date else '2024'}"
+            
+            # Build ML prediction data from database
+            ml_prediction = None
+            if applicant.ml_decision:
+                ml_prediction = {
+                    "decision": applicant.ml_decision,
+                    "confidence": float(applicant.ml_confidence) if applicant.ml_confidence else 0,
+                    "probability": float(applicant.ml_probability) if applicant.ml_probability else 0,
+                    "priority_level": applicant.ml_priority,
+                    "factors": applicant.ml_factors or {},
+                    "recommendation": applicant.ml_recommendation,
+                    "processed_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None
+                }
             
             submissions.append({
                 "id": applicant.id,
@@ -1711,6 +1831,12 @@ def get_applicant_submissions(request):
                 "submitted_at": applicant.application_date.isoformat() if applicant.application_date else user_obj.date_joined.isoformat(),
                 "email": applicant.email or user_obj.email,
                 "phone": applicant.phone or "",
+                "ml_prediction": ml_prediction,
+                "auto_processed": applicant.status in ['approved', 'rejected'] and applicant.ml_decision is not None,
+                "last_analyzed_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None,
+                "priority_level": applicant.ml_priority,
+                "eligibility_verified": applicant.status in ['approved', 'under_review', 'reviewed'],
+                "documents_valid": bool(applicant.msce and applicant.id_card and applicant.payment_proof)
             })
         
         return {
@@ -1736,7 +1862,7 @@ def get_applicant_submissions(request):
 @router.get("/applicant-submissions/{submission_id}", response={200: dict})
 @router.get("/applicant-submissions/{submission_id}/", response={200: dict})
 def get_applicant_submission(request, submission_id: int):
-    """Get a single applicant submission by ID"""
+    """Get a single applicant submission by ID with ML data from database"""
     try:
         user = get_user_from_token(request)
         
@@ -1756,7 +1882,20 @@ def get_applicant_submission(request, submission_id: int):
         if not programme_name:
             programme_name = applicant.program or "Not specified"
         
-        reference_number = f"APP-{applicant.id:06d}-{applicant.application_date.strftime('%Y') if applicant.application_date else '2024'}"
+        reference_number = applicant.reference_number or f"APP-{applicant.id:06d}-{applicant.application_date.strftime('%Y') if applicant.application_date else '2024'}"
+        
+        # Build ML prediction from database
+        ml_prediction = None
+        if applicant.ml_decision:
+            ml_prediction = {
+                "decision": applicant.ml_decision,
+                "confidence": float(applicant.ml_confidence) if applicant.ml_confidence else 0,
+                "probability": float(applicant.ml_probability) if applicant.ml_probability else 0,
+                "priority_level": applicant.ml_priority,
+                "factors": applicant.ml_factors or {},
+                "recommendation": applicant.ml_recommendation,
+                "processed_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None
+            }
         
         next_of_kin_list = []
         for kin in NextOfKin.objects.filter(user=user_obj):
@@ -1803,7 +1942,10 @@ def get_applicant_submission(request, submission_id: int):
             "home_district": applicant.home_district,
             "physical_address": applicant.physical_address,
             "next_of_kin": next_of_kin_list,
-            "subject_records": subject_records
+            "subject_records": subject_records,
+            "ml_prediction": ml_prediction,
+            "last_analyzed_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None,
+            "priority_level": applicant.ml_priority
         }
         
         return {
@@ -1820,6 +1962,139 @@ def get_applicant_submission(request, submission_id: int):
             "success": False,
             "message": str(e)
         }
+
+# ==================== TEACHING SUBJECTS SCHEMAS ====================
+class TeachingSubjectSchema(Schema):
+    id: Optional[int] = None
+    subject_name: str
+    subject_code: str
+    teaching_level: str  # 'junior', 'senior', 'both'
+    is_major: bool = False
+
+class TeachingSubjectsSaveSchema(Schema):
+    subjects: List[TeachingSubjectSchema]
+
+# ==================== TEACHING SUBJECTS ENDPOINTS ====================
+@router.get("/teaching-subjects", response={200: dict, 401: dict})
+@router.get("/teaching-subjects/", response={200: dict, 401: dict})
+def get_teaching_subjects(request):
+    """Get all teaching subjects for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import TeachingSubject
+        
+        subjects = TeachingSubject.objects.filter(user=user).order_by('subject_name')
+        
+        data = []
+        for subject in subjects:
+            data.append({
+                "id": subject.id,
+                "subject_name": subject.subject_name,
+                "subject_code": subject.subject_code,
+                "teaching_level": subject.teaching_level,
+                "is_major": subject.is_major
+            })
+        
+        return {
+            "success": True,
+            "message": "Teaching subjects retrieved successfully",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching teaching subjects: {str(e)}")
+        return {
+            "success": True,
+            "message": "No teaching subjects found",
+            "data": [],
+            "count": 0
+        }
+
+
+@router.post("/teaching-subjects", response={200: dict, 401: dict})
+@router.post("/teaching-subjects/", response={200: dict, 401: dict})
+def save_teaching_subjects(request, data: TeachingSubjectsSaveSchema):
+    """Save all teaching subjects for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import TeachingSubject
+        
+        # Delete existing subjects for this user
+        TeachingSubject.objects.filter(user=user).delete()
+        
+        # Create new subjects
+        created_subjects = []
+        for subject_data in data.subjects:
+            teaching_subject = TeachingSubject.objects.create(
+                user=user,
+                subject_name=subject_data.subject_name,
+                subject_code=subject_data.subject_code,
+                teaching_level=subject_data.teaching_level,
+                is_major=subject_data.is_major
+            )
+            created_subjects.append({
+                "id": teaching_subject.id,
+                "subject_name": teaching_subject.subject_name,
+                "subject_code": teaching_subject.subject_code,
+                "teaching_level": teaching_subject.teaching_level,
+                "is_major": teaching_subject.is_major
+            })
+        
+        return {
+            "success": True,
+            "message": f"Saved {len(created_subjects)} teaching subjects",
+            "data": created_subjects
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error saving teaching subjects: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to save teaching subjects: {str(e)}"
+        }
+
+
+@router.delete("/teaching-subjects/{subject_id}", response={200: dict, 401: dict, 404: dict})
+@router.delete("/teaching-subjects/{subject_id}/", response={200: dict, 401: dict, 404: dict})
+def delete_teaching_subject(request, subject_id: int):
+    """Delete a specific teaching subject"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import TeachingSubject
+        
+        try:
+            subject = TeachingSubject.objects.get(id=subject_id, user=user)
+        except TeachingSubject.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Teaching subject not found"
+            }
+        
+        subject.delete()
+        
+        return {
+            "success": True,
+            "message": "Teaching subject deleted successfully"
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting teaching subject: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to delete teaching subject: {str(e)}"
+        }    
+
+
 
 @router.patch("/applicant-submissions/{submission_id}/status")
 @router.patch("/applicant-submissions/{submission_id}/status/")
@@ -1871,14 +2146,16 @@ def update_submission_status(request, submission_id: int):
             "message": str(e)
         }
 
+
+
 @router.patch("/applicant-submissions/{submission_id}/ml-prediction")
 @router.patch("/applicant-submissions/{submission_id}/ml-prediction/")
 def update_ml_prediction(request, submission_id: int):
-    """Update ML prediction for an applicant submission"""
+    """Update ML prediction for an applicant submission and save to database"""
     try:
         user = get_user_from_token(request)
         
-        body = json.loads(request.body)
+        body = json.loads(request.body) if request.body else {}
         ml_prediction = body.get('ml_prediction')
         last_analyzed_at = body.get('last_analyzed_at')
         
@@ -1899,16 +2176,52 @@ def update_ml_prediction(request, submission_id: int):
                 "message": "Submission not found"
             }
         
-        print(f"✅ ML Prediction for {applicant.first_name} {applicant.last_name}:")
-        print(f"   Decision: {ml_prediction.get('decision')}")
-        print(f"   Confidence: {ml_prediction.get('confidence')}")
+        # ==== STORE ML PREDICTION IN DATABASE ====
+        applicant.ml_decision = ml_prediction.get('decision')
+        applicant.ml_confidence = ml_prediction.get('confidence')
+        applicant.ml_probability = ml_prediction.get('probability', ml_prediction.get('confidence'))
+        
+        # Calculate priority level based on decision and confidence
+        if ml_prediction.get('decision') == 'approve':
+            if ml_prediction.get('confidence', 0) > 0.7:
+                applicant.ml_priority = 'High'
+            else:
+                applicant.ml_priority = 'Medium'
+        elif ml_prediction.get('decision') == 'reject':
+            applicant.ml_priority = 'Low'
+        else:
+            applicant.ml_priority = 'Medium'
+        
+        # Store factors and recommendation
+        applicant.ml_factors = {
+            'reasons': ml_prediction.get('reasons', []),
+            'risk_factors': ml_prediction.get('risk_factors', [])
+        }
+        applicant.ml_recommendation = ml_prediction.get('recommendation', '')
+        applicant.ml_processed_at = datetime.now()
+        applicant.ml_raw_response = ml_prediction
+        applicant.save()
+        # =======================================
+        
+        print(f"✅ ML Prediction saved to database for {applicant.first_name} {applicant.last_name}:")
+        print(f"   Decision: {applicant.ml_decision}")
+        print(f"   Confidence: {applicant.ml_confidence}")
+        print(f"   Priority: {applicant.ml_priority}")
         
         return {
             "success": True,
             "message": "ML prediction saved successfully",
             "data": {
                 "id": applicant.id,
-                "ml_prediction": ml_prediction
+                "ml_prediction": {
+                    "decision": applicant.ml_decision,
+                    "confidence": applicant.ml_confidence,
+                    "probability": applicant.ml_probability,
+                    "priority_level": applicant.ml_priority,
+                    "factors": applicant.ml_factors,
+                    "recommendation": applicant.ml_recommendation,
+                    "processed_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None
+                }
             }
         }
         
@@ -1920,6 +2233,9 @@ def update_ml_prediction(request, submission_id: int):
             "success": False,
             "message": f"Failed to save ML prediction: {str(e)}"
         }
+
+
+
 
 # ==================== APPLICANT MANAGEMENT ENDPOINTS ====================
 
@@ -1977,67 +2293,97 @@ def get_applicants(request):
         }
 
 # ==================== DOCUMENT UPLOAD ENDPOINTS ====================
-
-import os
-from django.core.files.storage import default_storage
-from django.core.files.base import ContentFile
-from django.conf import settings
-from django.http import FileResponse
+# In your API views.py or api.py - Make sure this endpoint properly saves files
 
 @router.post("/applicants/{applicant_id}/documents")
 @router.post("/applicants/{applicant_id}/documents/")
 def upload_documents(request, applicant_id: int):
-    """Upload documents for an applicant"""
+    """Upload documents for an applicant and store references in database"""
     try:
         user = get_user_from_token(request)
         
         try:
             applicant = Applicant.objects.get(id=applicant_id, user=user)
         except Applicant.DoesNotExist:
-            raise HttpError(404, "Applicant not found")
+            return {"success": False, "message": "Applicant not found"}, 404
         
         docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant_id))
         os.makedirs(docs_dir, exist_ok=True)
         
         result = {}
         
+        # Handle MSCE certificate upload
         if 'msce' in request.FILES:
             msce_file = request.FILES['msce']
             if msce_file.size > 5 * 1024 * 1024:
-                return {"success": False, "message": "File size must be less than 5MB"}
+                return {"success": False, "message": "File size must be less than 5MB"}, 400
+            
+            # Delete old file if exists
+            if applicant.msce:
+                old_path = os.path.join(settings.MEDIA_ROOT, applicant.msce)
+                if os.path.exists(old_path):
+                    os.remove(old_path)
             
             ext = msce_file.name.split('.')[-1]
             filename = f"msce_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
             filepath = os.path.join('documents', str(applicant_id), filename)
             saved_path = default_storage.save(filepath, ContentFile(msce_file.read()))
             
+            # Save to database immediately
+            applicant.msce = saved_path
+            applicant.msce_size = msce_file.size
+            applicant.msce_name = msce_file.name
+            applicant.save()  # IMPORTANT: Save to database
+            
             result['msce'] = saved_path
             result['msce_size'] = msce_file.size
             result['msce_name'] = msce_file.name
         
+        # Handle ID Card upload
         if 'id_card' in request.FILES:
             id_file = request.FILES['id_card']
             if id_file.size > 5 * 1024 * 1024:
-                return {"success": False, "message": "File size must be less than 5MB"}
+                return {"success": False, "message": "File size must be less than 5MB"}, 400
+            
+            if applicant.id_card:
+                old_path = os.path.join(settings.MEDIA_ROOT, applicant.id_card)
+                if os.path.exists(old_path):
+                    os.remove(old_path)
             
             ext = id_file.name.split('.')[-1]
             filename = f"id_card_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
             filepath = os.path.join('documents', str(applicant_id), filename)
             saved_path = default_storage.save(filepath, ContentFile(id_file.read()))
             
+            applicant.id_card = saved_path
+            applicant.id_card_size = id_file.size
+            applicant.id_card_name = id_file.name
+            applicant.save()  # IMPORTANT: Save to database
+            
             result['id_card'] = saved_path
             result['id_card_size'] = id_file.size
             result['id_card_name'] = id_file.name
         
+        # Handle Payment Proof upload
         if 'payment_proof' in request.FILES:
             payment_file = request.FILES['payment_proof']
             if payment_file.size > 5 * 1024 * 1024:
-                return {"success": False, "message": "File size must be less than 5MB"}
+                return {"success": False, "message": "File size must be less than 5MB"}, 400
+            
+            if applicant.payment_proof:
+                old_path = os.path.join(settings.MEDIA_ROOT, applicant.payment_proof)
+                if os.path.exists(old_path):
+                    os.remove(old_path)
             
             ext = payment_file.name.split('.')[-1]
             filename = f"payment_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
             filepath = os.path.join('documents', str(applicant_id), filename)
             saved_path = default_storage.save(filepath, ContentFile(payment_file.read()))
+            
+            applicant.payment_proof = saved_path
+            applicant.payment_proof_size = payment_file.size
+            applicant.payment_proof_name = payment_file.name
+            applicant.save()  # IMPORTANT: Save to database
             
             result['payment_proof'] = saved_path
             result['payment_proof_size'] = payment_file.size
@@ -2053,12 +2399,14 @@ def upload_documents(request, applicant_id: int):
         raise
     except Exception as e:
         print(f"Error uploading documents: {str(e)}")
-        return {"success": False, "message": f"Failed to upload: {str(e)}"}
+        return {"success": False, "message": f"Failed to upload: {str(e)}"}, 500
+
+        
 
 @router.get("/applicants/{applicant_id}/documents")
 @router.get("/applicants/{applicant_id}/documents/")
 def get_documents(request, applicant_id: int):
-    """Get all documents for an applicant"""
+    """Get all documents for an applicant from database"""
     try:
         user = get_user_from_token(request)
         
@@ -2068,40 +2416,20 @@ def get_documents(request, applicant_id: int):
             return {
                 "success": False,
                 "message": "Applicant not found"
-            }
+            }, 404
         
+        # Return stored document paths from the applicant record
         result = {
-            "msce": None,
-            "msce_size": None,
-            "msce_name": None,
-            "id_card": None,
-            "id_card_size": None,
-            "id_card_name": None,
-            "payment_proof": None,
-            "payment_proof_size": None,
-            "payment_proof_name": None
+            "msce": applicant.msce,
+            "msce_size": applicant.msce_size,
+            "msce_name": applicant.msce_name,
+            "id_card": applicant.id_card,
+            "id_card_size": applicant.id_card_size,
+            "id_card_name": applicant.id_card_name,
+            "payment_proof": applicant.payment_proof,
+            "payment_proof_size": applicant.payment_proof_size,
+            "payment_proof_name": applicant.payment_proof_name
         }
-        
-        docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant_id))
-        if os.path.exists(docs_dir):
-            for filename in os.listdir(docs_dir):
-                filepath = os.path.join(docs_dir, filename)
-                if os.path.isfile(filepath):
-                    file_size = os.path.getsize(filepath)
-                    relative_path = os.path.join('documents', str(applicant_id), filename)
-                    
-                    if filename.startswith('msce_'):
-                        result['msce'] = relative_path
-                        result['msce_size'] = file_size
-                        result['msce_name'] = filename
-                    elif filename.startswith('id_card_'):
-                        result['id_card'] = relative_path
-                        result['id_card_size'] = file_size
-                        result['id_card_name'] = filename
-                    elif filename.startswith('payment_'):
-                        result['payment_proof'] = relative_path
-                        result['payment_proof_size'] = file_size
-                        result['payment_proof_name'] = filename
         
         return {
             "success": True,
@@ -2116,7 +2444,8 @@ def get_documents(request, applicant_id: int):
         return {
             "success": False,
             "message": f"Failed to get documents: {str(e)}"
-        }
+        }, 500
+
 
 @router.delete("/applicants/{applicant_id}/documents/{field}")
 @router.delete("/applicants/{applicant_id}/documents/{field}/")
@@ -2131,7 +2460,7 @@ def delete_document(request, applicant_id: int, field: str):
             return {
                 "success": False,
                 "message": f"Invalid document field. Must be one of: {', '.join(valid_fields)}"
-            }
+            }, 400
         
         try:
             applicant = Applicant.objects.get(id=applicant_id, user=user)
@@ -2139,42 +2468,33 @@ def delete_document(request, applicant_id: int, field: str):
             return {
                 "success": False,
                 "message": "Applicant not found"
-            }
+            }, 404
         
-        # Get the document path
-        docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant_id))
+        # Get the document path from the applicant record
+        doc_path = getattr(applicant, field, None)
         
-        if not os.path.exists(docs_dir):
-            return {
-                "success": False,
-                "message": "No documents found for this applicant"
-            }
-        
-        # Find and delete the file matching the field
-        deleted = False
-        deleted_filename = None
-        
-        for filename in os.listdir(docs_dir):
-            if filename.startswith(f"{field}_"):
-                filepath = os.path.join(docs_dir, filename)
-                try:
-                    os.remove(filepath)
-                    deleted = True
-                    deleted_filename = filename
-                    print(f"✅ Deleted {field} document: {filename}")
-                except Exception as e:
-                    print(f"Error deleting file: {e}")
-                    return {
-                        "success": False,
-                        "message": f"Error deleting file: {str(e)}"
-                    }
-                break
-        
-        if not deleted:
+        if not doc_path:
             return {
                 "success": False,
                 "message": f"No {field} document found to delete"
-            }
+            }, 404
+        
+        # Delete the physical file
+        if doc_path:
+            file_path = os.path.join(settings.MEDIA_ROOT, doc_path)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    print(f"✅ Deleted physical file: {file_path}")
+                except Exception as e:
+                    print(f"Error deleting file: {e}")
+        
+        # Remove the fields from the applicant record
+        setattr(applicant, field, None)
+        setattr(applicant, f"{field}_size", None)
+        setattr(applicant, f"{field}_name", None)
+        applicant.save()
+        print(f"✅ Removed {field} reference from applicant record")
         
         return {
             "success": True,
@@ -2190,8 +2510,176 @@ def delete_document(request, applicant_id: int, field: str):
         return {
             "success": False,
             "message": f"Failed to delete document: {str(e)}"
+        }, 500
+
+
+
+
+# ==================== DOCUMENTS ENDPOINTS (without applicant_id) ====================
+
+@router.get("/documents", response={200: dict, 401: dict})
+@router.get("/documents/", response={200: dict, 401: dict})
+def get_all_documents(request):
+    """Get all documents for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Document
+        
+        documents = Document.objects.filter(user=user).order_by('-uploaded_at')
+        
+        documents_data = []
+        for doc in documents:
+            documents_data.append({
+                "id": doc.id,
+                "name": doc.name,
+                "type": doc.document_type,
+                "url": doc.file.url if doc.file else None,
+                "uploaded_at": doc.uploaded_at.isoformat() if doc.uploaded_at else None,
+                "verified": getattr(doc, 'verified', False),
+                "verified_at": getattr(doc, 'verified_at', None),
+                "size": getattr(doc, 'size', None)
+            })
+        
+        return {
+            "success": True,
+            "message": "Documents retrieved successfully",
+            "data": documents_data,
+            "count": len(documents_data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching documents: {str(e)}")
+        return {
+            "success": True,
+            "message": "No documents found",
+            "data": [],
+            "count": 0
         }
 
+
+@router.post("/documents", response={200: dict, 401: dict})
+@router.post("/documents/", response={200: dict, 401: dict})
+def upload_document(request):
+    """Upload a document for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        if 'file' not in request.FILES:
+            return {
+                "success": False,
+                "message": "No file provided"
+            }
+        
+        file = request.FILES['file']
+        
+        # Validate file type
+        allowed_types = ['image/jpeg', 'image/jpg', 'image/png', 'application/pdf']
+        if file.content_type not in allowed_types:
+            return {
+                "success": False,
+                "message": "Invalid file type. Please upload JPG, PNG, or PDF"
+            }
+        
+        # Validate file size (max 5MB)
+        if file.size > 5 * 1024 * 1024:
+            return {
+                "success": False,
+                "message": "File size must be less than 5MB"
+            }
+        
+        document_type = request.POST.get('document_type', 'other')
+        document_name = request.POST.get('document_name', file.name)
+        
+        # Create documents directory if it doesn't exist
+        docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(user.id))
+        os.makedirs(docs_dir, exist_ok=True)
+        
+        # Save file
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        ext = file.name.split('.')[-1]
+        filename = f"{document_type}_{user.id}_{timestamp}.{ext}"
+        filepath = os.path.join('documents', str(user.id), filename)
+        
+        saved_path = default_storage.save(filepath, ContentFile(file.read()))
+        
+        # Create Document record
+        Document.objects.create(
+            user=user,
+            file=saved_path,
+            document_type=document_type,
+            name=document_name,
+            size=file.size
+        )
+        
+        return {
+            "success": True,
+            "message": "Document uploaded successfully",
+            "data": {
+                "file_path": saved_path,
+                "file_name": file.name,
+                "file_size": file.size,
+                "document_type": document_type
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error uploading document: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to upload document: {str(e)}"
+        }
+
+
+@router.delete("/documents/{document_id}", response={200: dict, 401: dict, 404: dict})
+@router.delete("/documents/{document_id}/", response={200: dict, 401: dict, 404: dict})
+def delete_document_by_id(request, document_id: int):
+    """Delete a document by ID"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Document
+        
+        try:
+            document = Document.objects.get(id=document_id, user=user)
+        except Document.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Document not found"
+            }
+        
+        # Delete physical file
+        if document.file:
+            file_path = os.path.join(settings.MEDIA_ROOT, document.file.name)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    print(f"Error deleting file: {e}")
+        
+        document.delete()
+        
+        return {
+            "success": True,
+            "message": "Document deleted successfully"
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting document: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to delete document: {str(e)}"
+        }
+
+
+
+        
 # ==================== DASHBOARD STATS ENDPOINT ====================
 
 @router.get("/dashboard/stats", response={200: dict})
@@ -2572,7 +3060,6 @@ def submit_application(request):
             "message": f"Failed to submit application: {str(e)}"
         }
 # ==================== SUBMISSION STATUS ENDPOINT ====================
-
 @router.get("/submit/status", response={200: dict, 401: dict})
 @router.get("/submit/status/", response={200: dict, 401: dict})
 def get_submission_status(request):
@@ -2614,8 +3101,9 @@ def get_submission_status(request):
         return {
             "success": False,
             "message": str(e)
-        }
+        }, 500
 
+        
 # Helper function to generate reference number
 def generate_reference_number(applicant_id):
     """Generate a unique reference number"""
@@ -4113,6 +4601,198 @@ class RefereeResponseSchema(Schema):
     updated_at: Optional[str] = None
 
 
+
+
+# ==================== DIRECT ESSAY ENDPOINTS (without applicant_id) ====================
+
+@router.get("/essays", response={200: dict, 401: dict})
+@router.get("/essays/", response={200: dict, 401: dict})
+def get_essay_direct(request):
+    """Get essay for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Essay
+        
+        try:
+            essay = Essay.objects.get(user=user)
+            return {
+                "success": True,
+                "message": "Essay retrieved successfully",
+                "data": {
+                    "id": essay.id,
+                    "motivation": essay.motivation,
+                    "research_concept_note": essay.research_concept_note,
+                    "created_at": essay.created_at.isoformat() if essay.created_at else None,
+                    "updated_at": essay.updated_at.isoformat() if essay.updated_at else None
+                }
+            }
+        except Essay.DoesNotExist:
+            return {
+                "success": True,
+                "message": "No essay found",
+                "data": None
+            }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching essay: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to fetch essay: {str(e)}",
+            "data": None
+        }
+
+
+@router.post("/essays", response={200: dict, 401: dict})
+@router.post("/essays/", response={200: dict, 401: dict})
+def save_essay_direct(request, data: EssaySchema):
+    """Save or update essay for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Essay
+        
+        # Validate word count for motivation (max 500 words)
+        motivation_words = len(data.motivation.split()) if data.motivation else 0
+        if motivation_words > 500:
+            return {
+                "success": False,
+                "message": f"Motivation exceeds 500 words. Current word count: {motivation_words}"
+            }
+        
+        # Validate word count for research concept note if provided (max 1000 words)
+        if data.research_concept_note:
+            research_words = len(data.research_concept_note.split())
+            if research_words > 1000:
+                return {
+                    "success": False,
+                    "message": f"Research concept note exceeds 1000 words. Current word count: {research_words}"
+                }
+        
+        essay, created = Essay.objects.update_or_create(
+            user=user,
+            defaults={
+                'motivation': data.motivation or "",
+                'research_concept_note': data.research_concept_note,
+            }
+        )
+        
+        return {
+            "success": True,
+            "message": "Essay saved successfully" if not created else "Essay created successfully",
+            "data": {
+                "id": essay.id,
+                "motivation": essay.motivation,
+                "research_concept_note": essay.research_concept_note,
+                "word_count": {
+                    "motivation": motivation_words,
+                    "research_concept_note": len(data.research_concept_note.split()) if data.research_concept_note else 0
+                }
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error saving essay: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to save essay: {str(e)}"
+        }
+
+
+@router.put("/essays", response={200: dict, 401: dict})
+@router.put("/essays/", response={200: dict, 401: dict})
+def update_essay_direct(request, data: EssaySchema):
+    """Update essay for the authenticated user (alias for POST)"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Essay
+        
+        # Validate word count
+        motivation_words = len(data.motivation.split()) if data.motivation else 0
+        if motivation_words > 500:
+            return {
+                "success": False,
+                "message": f"Motivation exceeds 500 words. Current word count: {motivation_words}"
+            }
+        
+        if data.research_concept_note:
+            research_words = len(data.research_concept_note.split())
+            if research_words > 1000:
+                return {
+                    "success": False,
+                    "message": f"Research concept note exceeds 1000 words. Current word count: {research_words}"
+                }
+        
+        essay, created = Essay.objects.update_or_create(
+            user=user,
+            defaults={
+                'motivation': data.motivation or "",
+                'research_concept_note': data.research_concept_note,
+            }
+        )
+        
+        return {
+            "success": True,
+            "message": "Essay updated successfully",
+            "data": {
+                "id": essay.id,
+                "motivation": essay.motivation,
+                "research_concept_note": essay.research_concept_note,
+                "word_count": {
+                    "motivation": motivation_words,
+                    "research_concept_note": len(data.research_concept_note.split()) if data.research_concept_note else 0
+                }
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating essay: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to update essay: {str(e)}"
+        }
+
+
+@router.delete("/essays", response={200: dict, 401: dict})
+@router.delete("/essays/", response={200: dict, 401: dict})
+def delete_essay_direct(request):
+    """Delete essay for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Essay
+        
+        try:
+            essay = Essay.objects.get(user=user)
+            essay.delete()
+            return {
+                "success": True,
+                "message": "Essay deleted successfully"
+            }
+        except Essay.DoesNotExist:
+            return {
+                "success": True,
+                "message": "No essay found to delete"
+            }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting essay: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to delete essay: {str(e)}"
+        }
+
+
+
 # ==================== REFEREE ENDPOINTS (Nested under applicants) ====================
 
 # First, make sure the schema is defined
@@ -4467,6 +5147,931 @@ def delete_referee(request, applicant_id: int, referee_id: int):
             "success": False,
             "message": f"Failed to delete referee: {str(e)}"
         }
+
+
+
+
+
+# ==================== DIRECT REFEREE ENDPOINTS (without applicant_id) ====================
+
+@router.get("/referees", response={200: dict, 401: dict})
+@router.get("/referees/", response={200: dict, 401: dict})
+def get_all_referees(request):
+    """Get all referees for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Referee
+        
+        referees = Referee.objects.filter(user=user).order_by('-created_at')
+        
+        # Gender mapping for display
+        gender_mapping = {
+            'M': 'Male',
+            'F': 'Female',
+            'NB': 'Non-binary',
+            'O': 'Prefer not to say',
+            'OT': 'Other',
+        }
+        
+        data = []
+        for referee in referees:
+            data.append({
+                "id": referee.id,
+                "title": referee.title,
+                "first_name": referee.first_name,
+                "last_name": referee.last_name,
+                "gender": gender_mapping.get(referee.gender, 'Other'),
+                "email": referee.email,
+                "phone_number": referee.phone_number,
+                "referee_type": referee.referee_type,
+                "created_at": referee.created_at.isoformat() if referee.created_at else None,
+                "updated_at": referee.updated_at.isoformat() if referee.updated_at else None
+            })
+        
+        return {
+            "success": True,
+            "message": "Referees retrieved successfully",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching referees: {str(e)}")
+        return {
+            "success": True,
+            "message": "No referees found",
+            "data": [],
+            "count": 0
+        }
+
+
+@router.post("/referees", response={200: dict, 401: dict})
+@router.post("/referees/", response={200: dict, 401: dict})
+def create_referee_direct(request, data: RefereeSchema):
+    """Create a new referee for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Referee
+        
+        # Validate required fields
+        if not data.first_name or not data.first_name.strip():
+            return {
+                "success": False,
+                "message": "First name is required"
+            }
+        
+        if not data.last_name or not data.last_name.strip():
+            return {
+                "success": False,
+                "message": "Last name is required"
+            }
+        
+        # Validate email format
+        if not data.email or '@' not in data.email or '.' not in data.email:
+            return {
+                "success": False,
+                "message": "Invalid email format"
+            }
+        
+        # Validate phone number (basic validation)
+        if not data.phone_number or len(data.phone_number) < 10:
+            return {
+                "success": False,
+                "message": "Phone number must be at least 10 digits"
+            }
+        
+        # Validate title
+        valid_titles = ['Mr', 'Mrs', 'Miss', 'Ms', 'Dr', 'Prof', 'Mx']
+        if data.title not in valid_titles:
+            return {
+                "success": False,
+                "message": f"Invalid title. Must be one of: {', '.join(valid_titles)}"
+            }
+        
+        # Validate referee type
+        valid_referee_types = ['Academic', 'Professional', 'Personal', 'Supervisor', 'Manager', 'Colleague']
+        if data.referee_type not in valid_referee_types:
+            return {
+                "success": False,
+                "message": f"Invalid referee type. Must be one of: {', '.join(valid_referee_types)}"
+            }
+        
+        # Map gender from frontend values to database choices
+        gender_mapping = {
+            'Male': 'M',
+            'Female': 'F',
+            'Non-binary': 'NB',
+            'Prefer not to say': 'O',
+            'Other': 'OT',
+        }
+        
+        db_gender = gender_mapping.get(data.gender, 'O')
+        
+        # Create referee
+        referee = Referee.objects.create(
+            user=user,
+            title=data.title,
+            first_name=data.first_name.strip(),
+            last_name=data.last_name.strip(),
+            gender=db_gender,
+            email=data.email.strip(),
+            phone_number=data.phone_number.strip(),
+            referee_type=data.referee_type,
+        )
+        
+        # Create notification for the user
+        try:
+            from .models import Notification
+            Notification.objects.create(
+                user=user,
+                title="Referee Added",
+                message=f"Referee {referee.get_full_name()} has been added successfully.",
+                notification_type="info",
+                link="/dashboard/referees"
+            )
+        except Exception as notif_error:
+            print(f"Could not create notification: {notif_error}")
+        
+        # Return with gender mapped back for frontend
+        gender_reverse = {v: k for k, v in gender_mapping.items()}
+        
+        return {
+            "success": True,
+            "message": "Referee created successfully",
+            "data": {
+                "id": referee.id,
+                "title": referee.title,
+                "first_name": referee.first_name,
+                "last_name": referee.last_name,
+                "gender": gender_reverse.get(referee.gender, 'Other'),
+                "email": referee.email,
+                "phone_number": referee.phone_number,
+                "referee_type": referee.referee_type,
+                "created_at": referee.created_at.isoformat() if referee.created_at else None
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating referee: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to create referee: {str(e)}"
+        }
+
+
+@router.put("/referees/{referee_id}", response={200: dict, 401: dict, 404: dict})
+@router.put("/referees/{referee_id}/", response={200: dict, 401: dict, 404: dict})
+def update_referee_direct(request, referee_id: int, data: RefereeSchema):
+    """Update an existing referee for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Referee
+        
+        try:
+            referee = Referee.objects.get(id=referee_id, user=user)
+        except Referee.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Referee not found"
+            }
+        
+        # Validate required fields
+        if not data.first_name or not data.first_name.strip():
+            return {
+                "success": False,
+                "message": "First name is required"
+            }
+        
+        if not data.last_name or not data.last_name.strip():
+            return {
+                "success": False,
+                "message": "Last name is required"
+            }
+        
+        # Validate email format
+        if not data.email or '@' not in data.email or '.' not in data.email:
+            return {
+                "success": False,
+                "message": "Invalid email format"
+            }
+        
+        # Validate phone number
+        if not data.phone_number or len(data.phone_number) < 10:
+            return {
+                "success": False,
+                "message": "Phone number must be at least 10 digits"
+            }
+        
+        # Map gender
+        gender_mapping = {
+            'Male': 'M',
+            'Female': 'F',
+            'Non-binary': 'NB',
+            'Prefer not to say': 'O',
+            'Other': 'OT',
+        }
+        
+        db_gender = gender_mapping.get(data.gender, 'O')
+        
+        # Update referee
+        referee.title = data.title
+        referee.first_name = data.first_name.strip()
+        referee.last_name = data.last_name.strip()
+        referee.gender = db_gender
+        referee.email = data.email.strip()
+        referee.phone_number = data.phone_number.strip()
+        referee.referee_type = data.referee_type
+        referee.save()
+        
+        gender_reverse = {v: k for k, v in gender_mapping.items()}
+        
+        return {
+            "success": True,
+            "message": "Referee updated successfully",
+            "data": {
+                "id": referee.id,
+                "title": referee.title,
+                "first_name": referee.first_name,
+                "last_name": referee.last_name,
+                "gender": gender_reverse.get(referee.gender, 'Other'),
+                "email": referee.email,
+                "phone_number": referee.phone_number,
+                "referee_type": referee.referee_type,
+                "updated_at": referee.updated_at.isoformat() if referee.updated_at else None
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating referee: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to update referee: {str(e)}"
+        }
+
+
+@router.delete("/referees/{referee_id}", response={200: dict, 401: dict, 404: dict})
+@router.delete("/referees/{referee_id}/", response={200: dict, 401: dict, 404: dict})
+def delete_referee_direct(request, referee_id: int):
+    """Delete a referee for the authenticated user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Referee
+        
+        try:
+            referee = Referee.objects.get(id=referee_id, user=user)
+        except Referee.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Referee not found"
+            }
+        
+        referee_name = referee.get_full_name()
+        referee.delete()
+        
+        return {
+            "success": True,
+            "message": f"Referee '{referee_name}' deleted successfully",
+            "data": None
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting referee: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to delete referee: {str(e)}"
+        }
+
+
+# ==================== ADMIN FEES ENDPOINTS ====================
+
+@router.get("/admin/fees", response={200: dict, 401: dict})
+@router.get("/admin/fees/", response={200: dict, 401: dict})
+def get_all_fees(request):
+    """Get all fee submissions for admin"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Check if user is admin (you can add admin check here)
+        # For now, allow all authenticated users
+        
+        fees_list = []
+        
+        # Get all fee payments from the database
+        from .models import FeePayment
+        
+        fee_payments = FeePayment.objects.select_related('user').all().order_by('-uploaded_at')
+        
+        for fee_payment in fee_payments:
+            user_obj = fee_payment.user
+            
+            # Get applicant name
+            try:
+                applicant = Applicant.objects.get(user=user_obj)
+                applicant_name = f"{applicant.first_name} {applicant.last_name}".strip() or user_obj.username
+                programme = applicant.selected_programme_name or applicant.program or "Not specified"
+            except Applicant.DoesNotExist:
+                applicant_name = user_obj.username
+                programme = "Not specified"
+            
+            # Get fee status
+            status = fee_payment.status
+            
+            # Construct deposit slip URL
+            deposit_slip_url = None
+            if fee_payment.deposit_slip_path:
+                deposit_slip_url = f"/media/{fee_payment.deposit_slip_path}"
+            
+            fees_list.append({
+                "id": fee_payment.id,
+                "user_id": user_obj.id,
+                "applicant_name": applicant_name,
+                "programme": programme,
+                "amount": float(fee_payment.amount),
+                "status": status,
+                "deposit_slip": deposit_slip_url,
+                "paid_at": fee_payment.uploaded_at.isoformat() if fee_payment.uploaded_at else None,
+                "email": user_obj.email,
+            })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(fees_list)} fee submissions",
+            "data": fees_list,
+            "count": len(fees_list)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching fees: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": str(e),
+            "data": []
+        }, 400
+
+from django.views.decorators.csrf import csrf_exempt
+from ninja.security import django_auth
+
+# For the specific endpoint, you can disable CSRF by using @csrf_exempt
+# Or better, use the correct URL pattern
+
+@router.patch("/application-fees/{fee_id}/status", auth=None)  # Disable auth for this endpoint or use your JWT auth
+@router.patch("/application-fees/{fee_id}/status/", auth=None)
+def update_fee_status(request, fee_id: int):
+    """Update fee payment status"""
+    try:
+        # Get user from token instead of session
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return {"success": False, "message": "No authorization token"}, 401
+        
+        parts = auth_header.split()
+        if len(parts) != 2 or parts[0].lower() != 'bearer':
+            return {"success": False, "message": "Invalid authorization header"}, 401
+        
+        token = parts[1]
+        payload = decode_jwt_token(token)
+        if not payload:
+            return {"success": False, "message": "Invalid or expired token"}, 401
+        
+        try:
+            user = User.objects.get(id=payload['user_id'])
+        except User.DoesNotExist:
+            return {"success": False, "message": "User not found"}, 401
+        
+        import json
+        body = json.loads(request.body) if request.body else {}
+        new_status = body.get('status')
+        
+        if not new_status:
+            return {"success": False, "message": "Status is required"}, 400
+        
+        valid_statuses = ['pending', 'accepted', 'rejected', 'approved', 'processing', 'verified']
+        if new_status not in valid_statuses:
+            return {"success": False, "message": f"Invalid status. Must be one of: {', '.join(valid_statuses)}"}, 400
+        
+        from .models import FeePayment
+        
+        try:
+            fee_payment = FeePayment.objects.get(id=fee_id)
+        except FeePayment.DoesNotExist:
+            return {"success": False, "message": f"Fee payment with ID {fee_id} not found"}, 404
+        
+        fee_payment.status = new_status
+        fee_payment.save()
+        
+        # Create notification for the user
+        try:
+            from .models import Notification
+            
+            status_messages = {
+                'accepted': 'Your fee payment has been accepted!',
+                'approved': 'Your fee payment has been approved!',
+                'rejected': 'Your fee payment was rejected. Please contact admissions.',
+                'verified': 'Your fee payment has been verified!',
+                'processing': 'Your fee payment is being processed.',
+            }
+            
+            message = status_messages.get(new_status, f'Your fee payment status has been updated to {new_status}')
+            
+            Notification.objects.create(
+                user=fee_payment.user,
+                title="Fee Payment Status Update",
+                message=message,
+                notification_type="payment",
+                is_read=False,
+                link="/dashboard/fees"
+            )
+            print(f"✅ Notification created for user {fee_payment.user.username}")
+        except Exception as notif_error:
+            print(f"⚠️ Could not create notification: {notif_error}")
+        
+        return {
+            "success": True,
+            "message": f"Fee status updated to {new_status}",
+            "data": {
+                "id": fee_payment.id,
+                "user_id": fee_payment.user.id,
+                "status": fee_payment.status
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error updating fee status: {str(e)}")
+        return {"success": False, "message": str(e)}, 400        
+
+
+
+# ==================== NOTIFICATION PREFERENCES ENDPOINTS ====================
+
+class NotificationPreferencesSchema(Schema):
+    email_notifications: bool
+    application_updates: bool
+    deadline_reminders: bool
+    promotional_emails: bool
+
+@router.get("/notification-preferences", response={200: dict, 401: dict})
+@router.get("/notification-preferences/", response={200: dict, 401: dict})
+def get_notification_preferences(request):
+    """Get user's notification preferences"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import NotificationPreference
+        
+        try:
+            prefs = NotificationPreference.objects.get(user=user)
+            return {
+                "success": True,
+                "message": "Preferences retrieved",
+                "data": {
+                    "email_notifications": prefs.email_notifications,
+                    "application_updates": prefs.application_updates,
+                    "deadline_reminders": prefs.deadline_reminders,
+                    "promotional_emails": prefs.promotional_emails
+                }
+            }
+        except NotificationPreference.DoesNotExist:
+            # Return default preferences
+            return {
+                "success": True,
+                "message": "Using default preferences",
+                "data": {
+                    "email_notifications": True,
+                    "application_updates": True,
+                    "deadline_reminders": True,
+                    "promotional_emails": False
+                }
+            }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error getting preferences: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@router.put("/notification-preferences", response={200: dict, 401: dict})
+@router.put("/notification-preferences/", response={200: dict, 401: dict})
+def update_notification_preferences(request, data: NotificationPreferencesSchema):
+    """Update user's notification preferences"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import NotificationPreference
+        
+        prefs, created = NotificationPreference.objects.update_or_create(
+            user=user,
+            defaults={
+                'email_notifications': data.email_notifications,
+                'application_updates': data.application_updates,
+                'deadline_reminders': data.deadline_reminders,
+                'promotional_emails': data.promotional_emails
+            }
+        )
+        
+        return {
+            "success": True,
+            "message": "Preferences updated successfully",
+            "data": {
+                "email_notifications": prefs.email_notifications,
+                "application_updates": prefs.application_updates,
+                "deadline_reminders": prefs.deadline_reminders,
+                "promotional_emails": prefs.promotional_emails
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating preferences: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to update preferences: {str(e)}"
+        }
+
+
+# ==================== CHANGE PASSWORD ENDPOINT ====================
+
+class ChangePasswordSchema(Schema):
+    current_password: str
+    new_password: str
+
+@router.post("/change-password", response={200: dict, 400: dict, 401: dict})
+@router.post("/change-password/", response={200: dict, 400: dict, 401: dict})
+def change_password(request, data: ChangePasswordSchema):
+    """Change user's password"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Check current password
+        if not user.check_password(data.current_password):
+            return {
+                "success": False,
+                "message": "Current password is incorrect"
+            }
+        
+        # Validate new password length
+        if len(data.new_password) < 8:
+            return {
+                "success": False,
+                "message": "New password must be at least 8 characters"
+            }
+        
+        # Change password
+        user.set_password(data.new_password)
+        user.save()
+        
+        # Log the password change
+        from .models import UserActivityLog, AuditLog
+        UserActivityLog.objects.create(
+            user=user,
+            action="password_changed",
+            details="Password changed successfully",
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        AuditLog.objects.create(
+            user=user,
+            action="password_change",
+            resource_type="User",
+            resource_id=user.id,
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        return {
+            "success": True,
+            "message": "Password changed successfully"
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error changing password: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to change password: {str(e)}"
+        }
+
+
+# ==================== USER PROFILE SETTINGS ENDPOINTS ====================
+
+class ProfileSettingsSchema(Schema):
+    theme: str
+    font_size: str
+    language: Optional[str] = 'en'
+    timezone: Optional[str] = 'UTC'
+
+@router.get("/profile-settings", response={200: dict, 401: dict})
+@router.get("/profile-settings/", response={200: dict, 401: dict})
+def get_profile_settings(request):
+    """Get user's profile settings (theme, font size, etc.)"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import UserProfileSettings
+        
+        try:
+            settings = UserProfileSettings.objects.get(user=user)
+            return {
+                "success": True,
+                "message": "Settings retrieved",
+                "data": {
+                    "theme": settings.theme,
+                    "font_size": settings.font_size,
+                    "language": settings.language,
+                    "timezone": settings.timezone
+                }
+            }
+        except UserProfileSettings.DoesNotExist:
+            # Return default settings
+            return {
+                "success": True,
+                "message": "Using default settings",
+                "data": {
+                    "theme": "light",
+                    "font_size": "medium",
+                    "language": "en",
+                    "timezone": "UTC"
+                }
+            }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error getting profile settings: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+@router.put("/profile-settings", response={200: dict, 401: dict})
+@router.put("/profile-settings/", response={200: dict, 401: dict})
+def update_profile_settings(request, data: ProfileSettingsSchema):
+    """Update user's profile settings"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import UserProfileSettings
+        
+        settings, created = UserProfileSettings.objects.update_or_create(
+            user=user,
+            defaults={
+                'theme': data.theme,
+                'font_size': data.font_size,
+                'language': data.language,
+                'timezone': data.timezone
+            }
+        )
+        
+        return {
+            "success": True,
+            "message": "Settings updated successfully",
+            "data": {
+                "theme": settings.theme,
+                "font_size": settings.font_size,
+                "language": settings.language,
+                "timezone": settings.timezone
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating profile settings: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to update settings: {str(e)}"
+        }
+
+
+# ==================== SESSION MANAGEMENT ENDPOINTS ====================
+
+@router.get("/sessions", response={200: dict, 401: dict})
+@router.get("/sessions/", response={200: dict, 401: dict})
+def get_user_sessions(request):
+    """Get all active sessions for the user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import UserSession
+        
+        sessions = UserSession.objects.filter(user=user, is_active=True).order_by('-last_activity')
+        
+        sessions_data = []
+        for session in sessions:
+            sessions_data.append({
+                "id": session.id,
+                "session_key": session.session_key[:20] + "...",
+                "device_info": session.device_info,
+                "last_activity": session.last_activity.isoformat(),
+                "created_at": session.created_at.isoformat(),
+                "is_current": False  # You'll need to track current session
+            })
+        
+        return {
+            "success": True,
+            "message": "Sessions retrieved",
+            "data": sessions_data,
+            "count": len(sessions_data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error getting sessions: {str(e)}")
+        return {
+            "success": True,
+            "message": "No active sessions",
+            "data": [],
+            "count": 0
+        }
+
+@router.post("/sessions/logout-others", response={200: dict, 401: dict})
+@router.post("/sessions/logout-others/", response={200: dict, 401: dict})
+def logout_other_sessions(request):
+    """Logout all other sessions for the user"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import UserSession
+        
+        # Get current session key from request
+        auth_header = request.headers.get('Authorization')
+        current_session_key = auth_header[-32:] if auth_header else None
+        
+        # Deactivate all other sessions
+        updated_count = UserSession.objects.filter(
+            user=user, 
+            is_active=True
+        ).exclude(
+            session_key=current_session_key
+        ).update(is_active=False)
+        
+        # Log the action
+        from .models import UserActivityLog
+        UserActivityLog.objects.create(
+            user=user,
+            action="logged_out_other_sessions",
+            details=f"Logged out {updated_count} other sessions",
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        return {
+            "success": True,
+            "message": f"Logged out {updated_count} other sessions",
+            "data": {
+                "logged_out_count": updated_count
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error logging out other sessions: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to logout other sessions: {str(e)}"
+        }
+
+
+# ==================== DELETE ACCOUNT ENDPOINT ====================
+
+class DeleteAccountSchema(Schema):
+    confirmation: bool
+    password: Optional[str] = None
+
+@router.post("/delete-account", response={200: dict, 400: dict, 401: dict})
+@router.post("/delete-account/", response={200: dict, 400: dict, 401: dict})
+def delete_account(request, data: DeleteAccountSchema):
+    """Permanently delete user account"""
+    try:
+        user = get_user_from_token(request)
+        
+        if not data.confirmation:
+            return {
+                "success": False,
+                "message": "You must confirm account deletion"
+            }
+        
+        # Verify password if provided
+        if data.password and not user.check_password(data.password):
+            return {
+                "success": False,
+                "message": "Incorrect password"
+            }
+        
+        # Log the deletion before deleting
+        from .models import AuditLog, UserActivityLog
+        AuditLog.objects.create(
+            user=user,
+            action="account_deletion",
+            resource_type="User",
+            resource_id=user.id,
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        UserActivityLog.objects.create(
+            user=user,
+            action="account_deleted",
+            details="Account permanently deleted",
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        # Store user email for response
+        user_email = user.email
+        username = user.username
+        
+        # Delete user (this will cascade delete related models if on_delete=CASCADE is set)
+        user.delete()
+        
+        return {
+            "success": True,
+            "message": "Your account has been permanently deleted",
+            "data": {
+                "email": user_email,
+                "username": username
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting account: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to delete account: {str(e)}"
+        }
+
+
+# ==================== USER ACTIVITY LOGS ENDPOINT ====================
+
+@router.get("/activity-logs", response={200: dict, 401: dict})
+@router.get("/activity-logs/", response={200: dict, 401: dict})
+def get_user_activity_logs(request):
+    """Get user's activity logs"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import UserActivityLog
+        
+        logs = UserActivityLog.objects.filter(user=user).order_by('-created_at')[:50]
+        
+        logs_data = []
+        for log in logs:
+            logs_data.append({
+                "id": log.id,
+                "action": log.action,
+                "details": log.details,
+                "ip_address": log.ip_address,
+                "created_at": log.created_at.isoformat(),
+                "time_ago": get_time_ago(log.created_at) if hasattr(log.created_at, 'strftime') else "recent"
+            })
+        
+        return {
+            "success": True,
+            "message": "Activity logs retrieved",
+            "data": logs_data,
+            "count": len(logs_data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error getting activity logs: {str(e)}")
+        return {
+            "success": True,
+            "message": "No activity logs found",
+            "data": [],
+            "count": 0
+        }
+
 
 
 api.add_router("/ml", ml_router)
