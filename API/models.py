@@ -429,6 +429,12 @@ class Document(models.Model):
     document_type = models.CharField(max_length=100)
     file = models.FileField(upload_to='documents/')
     uploaded_at = models.DateTimeField(auto_now_add=True)
+    # Add missing fields that might be used
+    title = models.CharField(max_length=255, blank=True, null=True)
+    description = models.TextField(blank=True, null=True)
+    
+    def __str__(self):
+        return self.document_name
 
 class Education(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='education_records')
@@ -715,3 +721,29 @@ class AuditLog(models.Model):
     
     def __str__(self):
         return f"{self.user.username if self.user else 'Anonymous'} - {self.action} - {self.created_at}"
+
+
+# ==================== TEACHING SUBJECTS MODEL ====================
+class TeachingSubject(models.Model):
+    TEACHING_LEVEL_CHOICES = [
+        ('junior', 'Junior Secondary (Form 1-2)'),
+        ('senior', 'Senior Secondary (Form 3-4)'),
+        ('both', 'Both Junior & Senior'),
+    ]
+    
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='teaching_subjects')
+    subject_name = models.CharField(max_length=100)
+    subject_code = models.CharField(max_length=10, blank=True, null=True)
+    teaching_level = models.CharField(max_length=10, choices=TEACHING_LEVEL_CHOICES, default='both')
+    is_major = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'teaching_subjects'
+        ordering = ['subject_name']
+        verbose_name = 'Teaching Subject'
+        verbose_name_plural = 'Teaching Subjects'
+    
+    def __str__(self):
+        return f"{self.subject_name} ({self.get_teaching_level_display()})"

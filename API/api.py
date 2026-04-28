@@ -29,7 +29,8 @@ from .models import (
     FeeStatus, 
     CommitteeMember, 
     Notification, 
-    ProgrammeChoice
+    ProgrammeChoice,
+    TeachingSubject
 )
 
 api = NinjaAPI()
@@ -2726,11 +2727,10 @@ def dashboard_stats(request):
         }
 
 # ==================== APPLICATION FEES SUBMISSION ENDPOINT ====================
-
 @router.post("/application-fees", response={200: dict, 400: dict, 401: dict})
 @router.post("/application-fees/", response={200: dict, 400: dict, 401: dict})
 def submit_application_fees(request):
-    """Handle application fee submission"""
+    """Handle application fee submission and save to FeePayment model"""
     try:
         user = get_user_from_token(request)
         print(f"📝 Processing application fee for user {user.username}")
@@ -2764,18 +2764,29 @@ def submit_application_fees(request):
         filename = f"deposit_slip_{user.id}_{timestamp}.{ext}"
         filepath = os.path.join('fees', str(user.id), filename)
         
+        # Save the file
         saved_path = default_storage.save(filepath, ContentFile(deposit_slip.read()))
         
+        # CRITICAL: Save to FeePayment model
+        fee_payment, created = FeePayment.objects.get_or_create(user=user)
+        fee_payment.deposit_slip_path = saved_path  # Store the path
+        fee_payment.status = 'pending'
+        fee_payment.amount = 25000  # Or get from request
+        fee_payment.uploaded_at = datetime.now()
+        fee_payment.save()
+        
+        print(f"✅ Saved fee payment to database: ID={fee_payment.id}, Path={saved_path}")
+        
+        # Also update the Applicant model's payment_proof field for compatibility
         try:
-            fee_payment, created = FeePayment.objects.get_or_create(user=user)
-            fee_payment.deposit_slip_path = saved_path
-            fee_payment.status = 'pending'
-            fee_payment.amount = 25000
-            fee_payment.uploaded_at = datetime.now()
-            fee_payment.save()
-            print(f"✅ Saved to database: {fee_payment}")
-        except Exception as db_error:
-            print(f"⚠️ Database save error: {db_error}")
+            applicant = Applicant.objects.get(user=user)
+            applicant.payment_proof = saved_path
+            applicant.payment_proof_name = deposit_slip.name
+            applicant.payment_proof_size = deposit_slip.size
+            applicant.save()
+            print(f"✅ Updated Applicant payment_proof field")
+        except Applicant.DoesNotExist:
+            print(f"⚠️ Applicant not found for user {user.username}")
         
         return {
             "success": True,
@@ -2799,6 +2810,7 @@ def submit_application_fees(request):
             "message": f"Failed to submit deposit slip: {str(e)}"
         }
 
+
 @router.get("/application-fees", response={200: dict, 401: dict})
 @router.get("/application-fees/", response={200: dict, 401: dict})
 def get_application_fees(request):
@@ -2807,56 +2819,92 @@ def get_application_fees(request):
         user = get_user_from_token(request)
         print(f"📝 Fetching application fee status for user {user.username}")
         
+        # First check FeePayment model
+        from .models import FeePayment
+        import os
+        from django.conf import settings
+        
         try:
             fee_payment = FeePayment.objects.get(user=user)
+            
+            # Check if the file actually exists
+            file_exists = False
+            if fee_payment.deposit_slip_path:
+                full_path = os.path.join(settings.MEDIA_ROOT, fee_payment.deposit_slip_path)
+                file_exists = os.path.exists(full_path)
+            
             return {
                 "success": True,
-                "message": "Application fee found",
                 "data": {
                     "status": fee_payment.status,
-                    "file_path": fee_payment.deposit_slip_path,
+                    "deposit_slip_path": fee_payment.deposit_slip_path if file_exists else None,
+                    "file_path": fee_payment.deposit_slip_path if file_exists else None,
                     "uploaded_at": fee_payment.uploaded_at.isoformat() if fee_payment.uploaded_at else None,
                     "amount": float(fee_payment.amount)
                 }
             }
         except FeePayment.DoesNotExist:
+            print(f"⚠️ No FeePayment record found for user {user.username}")
+        
+        # Check Applicant model's payment_proof field as fallback
+        try:
+            from .models import Applicant
+            applicant = Applicant.objects.get(user=user)
+            if applicant.payment_proof:
+                print(f"✅ Found payment_proof in Applicant model: {applicant.payment_proof}")
+                return {
+                    "success": True,
+                    "data": {
+                        "status": "pending",
+                        "deposit_slip_path": applicant.payment_proof,
+                        "file_path": applicant.payment_proof,
+                        "file_name": applicant.payment_proof_name,
+                        "uploaded_at": applicant.application_date.isoformat() if applicant.application_date else None,
+                        "amount": 25000
+                    }
+                }
+        except Applicant.DoesNotExist:
             pass
         
+        # Check if file exists in media directory
         fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees', str(user.id))
-        
         if os.path.exists(fees_dir):
             files = os.listdir(fees_dir)
             deposit_slips = [f for f in files if f.startswith('deposit_slip_')]
-            
             if deposit_slips:
                 latest_slip = sorted(deposit_slips)[-1]
+                print(f"✅ Found deposit slip file in directory: {latest_slip}")
                 return {
                     "success": True,
-                    "message": "Application fee submitted",
                     "data": {
                         "status": "pending",
+                        "deposit_slip_path": os.path.join('fees', str(user.id), latest_slip),
+                        "file_path": os.path.join('fees', str(user.id), latest_slip),
                         "file_name": latest_slip,
-                        "submitted_date": datetime.fromtimestamp(os.path.getmtime(os.path.join(fees_dir, latest_slip))).isoformat()
+                        "uploaded_at": datetime.fromtimestamp(os.path.getmtime(os.path.join(fees_dir, latest_slip))).isoformat(),
+                        "amount": 25000
                     }
                 }
         
         return {
             "success": True,
-            "message": "No application fee submitted yet",
-            "data": {
-                "status": "pending"
-            }
+            "data": None
         }
         
     except HttpError:
         raise
     except Exception as e:
         print(f"Error fetching application fees: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "message": f"Failed to fetch status: {str(e)}"
         }
 
+
+
+        
 # ==================== GET SINGLE APPLICANT ENDPOINT ====================
 
 @router.get("/applicants/{applicant_id}", response={200: dict, 404: dict, 401: dict})
@@ -5708,7 +5756,6 @@ def update_notification_preferences(request, data: NotificationPreferencesSchema
             "success": False,
             "message": f"Failed to update preferences: {str(e)}"
         }
-
 
 # ==================== CHANGE PASSWORD ENDPOINT ====================
 
