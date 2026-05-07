@@ -14,6 +14,7 @@ from django.utils.html import strip_tags
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 from .ml.endpoints import ml_router
+from django.db import IntegrityError
 
 from django.http import FileResponse
 
@@ -170,6 +171,8 @@ class ProgrammeSchema(Schema):
     category: str
     code: Optional[str] = None
     is_active: bool = True
+    study_mode: Optional[str] = None  # ADD THIS
+    programme_type: Optional[str] = None  # ADD THIS
 
 # ==================== JWT HELPER FUNCTIONS ====================
 
@@ -1336,19 +1339,47 @@ def create_programme(request, data: ProgrammeSchema):
         print(f"   Department: {data.department}")
         print(f"   Category: {data.category}")
         print(f"   Duration: {data.duration}")
+        print(f"   Study Mode: {data.study_mode}")
+        print(f"   Programme Type: {data.programme_type}")
+        
+        # Generate a valid department code from the department name
+        dept_name = data.department
+        # Clean the department name for code generation
+        import re
+        clean_name = re.sub(r'[^a-zA-Z0-9\s]', '', dept_name)
+        words = clean_name.split()
+        
+        # Generate a better code - take first letter of each word, max 6 chars
+        if len(words) > 1:
+            code = ''.join(word[0].upper() for word in words if word)[:6]
+        else:
+            code = dept_name[:6].upper().replace(' ', '')
+        
+        # Ensure code is not empty
+        if not code:
+            code = dept_name[:6].upper()
+        
+        # Make sure code is unique by adding a number if needed
+        original_code = code
+        counter = 1
+        while Department.objects.filter(code=code).exists():
+            code = f"{original_code}{counter}"
+            counter += 1
         
         # Get or create department
         department_obj, created = Department.objects.get_or_create(
-            name=data.department,
+            name=dept_name,
             defaults={
-                'code': data.department[:10].upper().replace(' ', ''),
-                'description': f"Department of {data.department}",
+                'code': code,
+                'description': f"Department of {dept_name}",
                 'is_active': True
             }
         )
         
         if created:
-            print(f"✅ Created new department: {department_obj.name}")
+            print(f"✅ Created new department: {department_obj.name} with code: {department_obj.code}")
+        else:
+            print(f"📚 Using existing department: {department_obj.name}")
         
         # Check if programme with same name exists
         if Programme.objects.filter(name=data.name).exists():
@@ -1358,32 +1389,33 @@ def create_programme(request, data: ProgrammeSchema):
             }
         
         # Generate code if not provided
-        code = data.code
-        if not code or code == "":
+        prog_code = data.code
+        if not prog_code or prog_code == "":
             words = data.name.split()
-            code = ''.join(word[0].upper() for word in words if word)[:10]
+            prog_code = ''.join(word[0].upper() for word in words if word)[:10]
         
-        # Ensure unique code
-        original_code = code
+        # Ensure unique programme code
+        original_prog_code = prog_code
         counter = 1
-        while Programme.objects.filter(code=code).exists():
-            code = f"{original_code}{counter}"
+        while Programme.objects.filter(code=prog_code).exists():
+            prog_code = f"{original_prog_code}{counter}"
             counter += 1
         
-        # Create the programme
+        # Create the programme with all fields
         prog = Programme.objects.create(
             name=data.name,
             description=data.description or "",
             department=department_obj,
             duration=data.duration,
             category=data.category,
-            code=code,
-            is_active=data.is_active
+            code=prog_code,
+            is_active=data.is_active,
+            study_mode=data.study_mode or 'full time',
+            programme_type=data.programme_type or 'generic'
         )
         
         print(f"✅ Programme created: {prog.name} (ID: {prog.id})")
         
-        # Return the created programme
         return {
             "id": prog.id,
             "name": prog.name,
@@ -1392,11 +1424,19 @@ def create_programme(request, data: ProgrammeSchema):
             "duration": prog.duration,
             "category": prog.category,
             "code": prog.code,
-            "is_active": prog.is_active
+            "is_active": prog.is_active,
+            "study_mode": prog.study_mode,
+            "programme_type": prog.programme_type
         }
         
     except HttpError:
         raise
+    except IntegrityError as e:
+        print(f"❌ Integrity error creating programme: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
     except Exception as e:
         print(f"❌ Error creating programme: {str(e)}")
         import traceback
@@ -1407,6 +1447,7 @@ def create_programme(request, data: ProgrammeSchema):
             "message": f"Failed to create programme: {str(e)}"
         }
 
+        
 @router.put("/programmes/{programme_id}", response={200: dict, 400: dict, 404: dict, 401: dict})
 @router.put("/programmes/{programme_id}/", response={200: dict, 400: dict, 404: dict, 401: dict})
 def update_programme(request, programme_id: int, data: ProgrammeSchema):
@@ -1417,7 +1458,10 @@ def update_programme(request, programme_id: int, data: ProgrammeSchema):
         try:
             prog = Programme.objects.get(id=programme_id)
         except Programme.DoesNotExist:
-            raise HttpError(404, "Programme not found")
+            return {
+                "success": False,
+                "message": "Programme not found"
+            }
         
         try:
             department_obj = Department.objects.get(name=data.department)
@@ -1444,6 +1488,8 @@ def update_programme(request, programme_id: int, data: ProgrammeSchema):
         prog.category = data.category
         prog.code = code
         prog.is_active = data.is_active
+        prog.study_mode = data.study_mode or prog.study_mode
+        prog.programme_type = data.programme_type or prog.programme_type
         prog.save()
         
         return {
@@ -1457,7 +1503,9 @@ def update_programme(request, programme_id: int, data: ProgrammeSchema):
                 "duration": prog.duration,
                 "category": prog.category,
                 "code": prog.code,
-                "is_active": prog.is_active
+                "is_active": prog.is_active,
+                "study_mode": prog.study_mode,
+                "programme_type": prog.programme_type
             }
         }
         
@@ -1470,6 +1518,8 @@ def update_programme(request, programme_id: int, data: ProgrammeSchema):
             "message": f"Failed to update programme: {str(e)}"
         }
 
+
+        
 @router.delete("/programmes/{programme_id}", response={200: dict, 404: dict, 401: dict})
 @router.delete("/programmes/{programme_id}/", response={200: dict, 404: dict, 401: dict})
 def delete_programme(request, programme_id: int):
@@ -7310,6 +7360,8 @@ def delete_application_type(request, type_id: str):
             "success": False,
             "message": str(e)
         }
+# In your api.py, update the ProgrammeSchema:
+
 class ProgrammeSchema(Schema):
     name: str
     description: Optional[str] = None
@@ -7318,6 +7370,9 @@ class ProgrammeSchema(Schema):
     category: str
     code: Optional[str] = None
     is_active: bool = True
+    study_mode: Optional[str] = None  # Add this
+    programme_type: Optional[str] = None  # Add this
+
 
 # ==================== APPLICATION TYPES STORAGE ====================
 # Add the storage variables HERE
