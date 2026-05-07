@@ -54,6 +54,26 @@ class DocumentResponseSchema(Schema):
     message: str
     data: Optional[DocumentUploadSchema] = None
 
+# Add these schema definitions with your other schemas (near line 100-150)
+
+class ApplicationTypeSchema(Schema):
+    name: str
+    description: str
+    requirements: List[str]
+    start_date: str
+    end_date: str
+    is_active: bool = True
+
+class ApplicationTypeUpdateSchema(Schema):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    requirements: Optional[List[str]] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+
 class SubjectRecordSchema(Schema):
     qualification: str
     centre_number: str
@@ -6690,8 +6710,653 @@ def get_processing_stats(request):
             "message": str(e),
             "data": None
         }
+# ==================== ADMIN USER MANAGEMENT ENDPOINTS ====================
+
+@router.get("/admin/users", response={200: dict, 401: dict})
+@router.get("/admin/users/", response={200: dict, 401: dict})
+def admin_get_users(request):
+    """Get all users for admin panel"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Check if user is admin (you can add proper admin check)
+        # For now, allow all authenticated users or check for admin flag
+        
+        users_list = User.objects.all().order_by('-date_joined')
+        
+        data = []
+        for u in users_list:
+            try:
+                applicant = Applicant.objects.get(user=u)
+                role = applicant.program or 'guest'
+                status = applicant.status
+                application_date = applicant.application_date.isoformat() if applicant.application_date else None
+            except Applicant.DoesNotExist:
+                role = 'guest'
+                status = 'registered'
+                application_date = None
+            
+            data.append({
+                "id": u.id,
+                "username": u.username,
+                "email": u.email,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "role": role,
+                "status": status,
+                "is_active": u.is_active,
+                "date_joined": u.date_joined.isoformat(),
+                "last_login": u.last_login.isoformat() if u.last_login else None,
+                "application_date": application_date
+            })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(data)} users",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching users: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e),
+            "data": []
+        }
 
 
+@router.get("/admin/users/{user_id}", response={200: dict, 401: dict, 404: dict})
+@router.get("/admin/users/{user_id}/", response={200: dict, 401: dict, 404: dict})
+def admin_get_user(request, user_id: int):
+    """Get a single user by ID for admin panel"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            u = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"User with ID {user_id} not found"
+            }
+        
+        try:
+            applicant = Applicant.objects.get(user=u)
+            role = applicant.program or 'guest'
+            status = applicant.status
+            phone = applicant.phone
+            gender = applicant.gender
+            nationality = applicant.nationality
+            national_id = applicant.national_id
+            home_district = applicant.home_district
+            physical_address = applicant.physical_address
+            selected_programme = applicant.selected_programme_name
+        except Applicant.DoesNotExist:
+            role = 'guest'
+            status = 'registered'
+            phone = ""
+            gender = ""
+            nationality = ""
+            national_id = ""
+            home_district = ""
+            physical_address = ""
+            selected_programme = ""
+        
+        return {
+            "success": True,
+            "message": "User found",
+            "data": {
+                "id": u.id,
+                "username": u.username,
+                "email": u.email,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "role": role,
+                "status": status,
+                "is_active": u.is_active,
+                "date_joined": u.date_joined.isoformat(),
+                "last_login": u.last_login.isoformat() if u.last_login else None,
+                "phone": phone,
+                "gender": gender,
+                "nationality": nationality,
+                "national_id": national_id,
+                "home_district": home_district,
+                "physical_address": physical_address,
+                "selected_programme": selected_programme
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching user: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
 
+
+@router.put("/admin/users/{user_id}/role", response={200: dict, 401: dict, 404: dict})
+@router.put("/admin/users/{user_id}/role/", response={200: dict, 401: dict, 404: dict})
+def admin_update_user_role(request, user_id: int, data: UpdateRoleSchema):
+    """Update a user's role (admin only)"""
+    try:
+        admin_user = get_user_from_token(request)
+        
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"User with ID {user_id} not found"
+            }
+        
+        valid_roles = ['admin', 'staff', 'odl', 'postgraduate', 'diploma', 'international', 'weekend', 'masters', 'guest']
+        if data.role not in valid_roles:
+            return {
+                "success": False,
+                "message": f"Invalid role. Must be one of: {', '.join(valid_roles)}"
+            }
+        
+        try:
+            applicant, created = Applicant.objects.get_or_create(user=target_user)
+            applicant.program = data.role if data.role != 'guest' else None
+            applicant.save()
+        except Exception as e:
+            print(f"Error updating applicant: {str(e)}")
+        
+        # Log the role change - FIXED: Use new_value instead of details
+        from .models import AuditLog
+        AuditLog.objects.create(
+            user=admin_user,
+            action="role_update",
+            resource_type="User",
+            resource_id=target_user.id,
+            new_value=f"Role updated to {data.role}",  # Changed from details
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        return {
+            "success": True,
+            "message": f"User role updated to {data.role}",
+            "data": {
+                "user_id": target_user.id,
+                "email": target_user.email,
+                "role": data.role
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating user role: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.delete("/admin/users/{user_id}", response={200: dict, 401: dict, 404: dict})
+@router.delete("/admin/users/{user_id}/", response={200: dict, 401: dict, 404: dict})
+def admin_delete_user(request, user_id: int):
+    """Delete a user (admin only)"""
+    try:
+        admin_user = get_user_from_token(request)
+        
+        if admin_user.id == user_id:
+            return {
+                "success": False,
+                "message": "You cannot delete your own account"
+            }
+        
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"User with ID {user_id} not found"
+            }
+        
+        user_email = target_user.email
+        
+        # Log the deletion - FIXED: Use new_value instead of details
+        from .models import AuditLog
+        AuditLog.objects.create(
+            user=admin_user,
+            action="user_deletion",
+            resource_type="User",
+            resource_id=user_id,
+            new_value=f"Deleted user: {user_email}",  # Changed from details
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        target_user.delete()
+        
+        return {
+            "success": True,
+            "message": f"User {user_email} has been deleted"
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting user: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+# ==================== ADMIN AUDIT LOGS ENDPOINT ====================
+
+@router.get("/admin/audit-logs", response={200: dict, 401: dict})
+@router.get("/admin/audit-logs/", response={200: dict, 401: dict})
+def admin_get_audit_logs(request):
+    """Get audit logs for admin panel"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import AuditLog
+        
+        logs = AuditLog.objects.all().order_by('-created_at')[:100]
+        
+        data = []
+        for log in logs:
+            # FIXED: Map new_value to details for frontend compatibility
+            details_value = log.new_value if hasattr(log, 'new_value') else (log.details if hasattr(log, 'details') else "")
+            
+            data.append({
+                "id": log.id,
+                "user_id": log.user.id if log.user else None,
+                "user_email": log.user.email if log.user else "System",
+                "user_name": f"{log.user.first_name} {log.user.last_name}".strip() if log.user else "System",
+                "action": log.action,
+                "resource_type": log.resource_type or "",
+                "resource_id": log.resource_id,
+                "details": details_value,  # Map to details field
+                "ip_address": log.ip_address,
+                "user_agent": log.user_agent,
+                "created_at": log.created_at.isoformat(),
+                "time_ago": get_time_ago(log.created_at)
+            })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(data)} audit logs",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching audit logs: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e),
+            "data": []
+        }
+
+
+# ==================== ADMIN BACKUP ENDPOINT ====================
+
+@router.post("/admin/backup", response={200: dict, 401: dict})
+@router.post("/admin/backup/", response={200: dict, 401: dict})
+def admin_create_backup(request):
+    """Create a database backup (admin only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        import json
+        from django.core import serializers
+        
+        backup_data = {
+            "created_at": datetime.now().isoformat(),
+            "created_by": user.email,
+            "data": {
+                "users": json.loads(serializers.serialize('json', User.objects.all())),
+                "applicants": json.loads(serializers.serialize('json', Applicant.objects.all())),
+                "programmes": json.loads(serializers.serialize('json', Programme.objects.all())),
+                "departments": json.loads(serializers.serialize('json', Department.objects.all())),
+                "next_of_kin": json.loads(serializers.serialize('json', NextOfKin.objects.all())),
+                "subject_records": json.loads(serializers.serialize('json', SubjectRecord.objects.all())),
+            }
+        }
+        
+        # Save backup to file
+        backup_dir = os.path.join(settings.MEDIA_ROOT, 'backups')
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        backup_filename = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        backup_path = os.path.join(backup_dir, backup_filename)
+        
+        with open(backup_path, 'w') as f:
+            json.dump(backup_data, f, indent=2)
+        
+        # Log the backup - FIXED: Use new_value instead of details
+        from .models import AuditLog
+        AuditLog.objects.create(
+            user=user,
+            action="backup_created",
+            resource_type="System",
+            resource_id=None,
+            new_value=f"Created backup: {backup_filename}",  # Changed from details
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        return {
+            "success": True,
+            "message": "Backup created successfully",
+            "data": {
+                "filename": backup_filename,
+                "path": backup_path,
+                "size": os.path.getsize(backup_path),
+                "created_at": backup_data["created_at"]
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating backup: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.get("/admin/application-types")
+@router.get("/admin/application-types/")
+def get_application_types(request):
+    """Get all application types (admin only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            applicant = Applicant.objects.get(user=user)
+            role = applicant.program or 'guest'
+        except Applicant.DoesNotExist:
+            role = 'guest'
+        
+        if role not in ['admin', 'administrator', 'staff']:
+            return {
+                "success": False,
+                "message": "Admin access required",
+                "data": []
+            }
+        
+        return {
+            "success": True,
+            "message": "Application types retrieved successfully",
+            "data": _application_types,
+            "count": len(_application_types)
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error fetching application types: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e),
+            "data": []
+        }
+
+
+@router.post("/admin/application-types")
+@router.post("/admin/application-types/")
+def create_application_type(request, data: ApplicationTypeSchema):
+    """Create a new application type (admin only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            applicant = Applicant.objects.get(user=user)
+            role = applicant.program or 'guest'
+        except Applicant.DoesNotExist:
+            role = 'guest'
+        
+        if role not in ['admin', 'administrator', 'staff']:
+            return {
+                "success": False,
+                "message": "Admin access required"
+            }
+        
+        global _application_type_counter
+        
+        # Validate dates
+        try:
+            start_date = datetime.strptime(data.start_date, "%Y-%m-%d")
+            end_date = datetime.strptime(data.end_date, "%Y-%m-%d")
+            if start_date > end_date:
+                return {
+                    "success": False,
+                    "message": "Start date must be before end date"
+                }
+        except ValueError:
+            return {
+                "success": False,
+                "message": "Invalid date format. Use YYYY-MM-DD"
+            }
+        
+        new_type = {
+            "id": str(_application_type_counter),
+            "name": data.name,
+            "description": data.description,
+            "requirements": data.requirements,
+            "start_date": data.start_date,
+            "end_date": data.end_date,
+            "is_active": data.is_active
+        }
+        
+        _application_types.append(new_type)
+        _application_type_counter += 1
+        
+        return {
+            "success": True,
+            "message": "Application type created successfully",
+            "data": new_type
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error creating application type: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.put("/admin/application-types/{type_id}")
+@router.put("/admin/application-types/{type_id}/")
+def update_application_type(request, type_id: str, data: ApplicationTypeUpdateSchema):
+    """Update an existing application type (admin only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            applicant = Applicant.objects.get(user=user)
+            role = applicant.program or 'guest'
+        except Applicant.DoesNotExist:
+            role = 'guest'
+        
+        if role not in ['admin', 'administrator', 'staff']:
+            return {
+                "success": False,
+                "message": "Admin access required"
+            }
+        
+        # Find the type
+        type_index = None
+        for i, app_type in enumerate(_application_types):
+            if app_type["id"] == type_id:
+                type_index = i
+                break
+        
+        if type_index is None:
+            return {
+                "success": False,
+                "message": "Application type not found"
+            }
+        
+        # Update fields if provided
+        if data.name is not None:
+            _application_types[type_index]["name"] = data.name
+        if data.description is not None:
+            _application_types[type_index]["description"] = data.description
+        if data.requirements is not None:
+            _application_types[type_index]["requirements"] = data.requirements
+        if data.start_date is not None:
+            try:
+                start_date = datetime.strptime(data.start_date, "%Y-%m-%d")
+                end_date = datetime.strptime(_application_types[type_index]["end_date"], "%Y-%m-%d")
+                if start_date > end_date:
+                    return {
+                        "success": False,
+                        "message": "Start date must be before end date"
+                    }
+            except ValueError:
+                return {
+                    "success": False,
+                    "message": "Invalid date format. Use YYYY-MM-DD"
+                }
+            _application_types[type_index]["start_date"] = data.start_date
+        if data.end_date is not None:
+            try:
+                start_date = datetime.strptime(_application_types[type_index]["start_date"], "%Y-%m-%d")
+                end_date = datetime.strptime(data.end_date, "%Y-%m-%d")
+                if start_date > end_date:
+                    return {
+                        "success": False,
+                        "message": "Start date must be before end date"
+                    }
+            except ValueError:
+                return {
+                    "success": False,
+                    "message": "Invalid date format. Use YYYY-MM-DD"
+                }
+            _application_types[type_index]["end_date"] = data.end_date
+        if data.is_active is not None:
+            _application_types[type_index]["is_active"] = data.is_active
+        
+        return {
+            "success": True,
+            "message": "Application type updated successfully",
+            "data": _application_types[type_index]
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating application type: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.delete("/admin/application-types/{type_id}")
+@router.delete("/admin/application-types/{type_id}/")
+def delete_application_type(request, type_id: str):
+    """Delete an application type (admin only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            applicant = Applicant.objects.get(user=user)
+            role = applicant.program or 'guest'
+        except Applicant.DoesNotExist:
+            role = 'guest'
+        
+        if role not in ['admin', 'administrator', 'staff']:
+            return {
+                "success": False,
+                "message": "Admin access required"
+            }
+        
+        # Find and delete the type
+        type_index = None
+        for i, app_type in enumerate(_application_types):
+            if app_type["id"] == type_id:
+                type_index = i
+                break
+        
+        if type_index is None:
+            return {
+                "success": False,
+                "message": "Application type not found"
+            }
+        
+        deleted_type = _application_types.pop(type_index)
+        
+        return {
+            "success": True,
+            "message": f"Application type '{deleted_type['name']}' deleted successfully",
+            "data": None
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting application type: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+class ProgrammeSchema(Schema):
+    name: str
+    description: Optional[str] = None
+    department: str
+    duration: str
+    category: str
+    code: Optional[str] = None
+    is_active: bool = True
+
+# ==================== APPLICATION TYPES STORAGE ====================
+# Add the storage variables HERE
+_application_types = []
+_application_type_counter = 1
+
+_application_types = [
+    {
+        "id": "1",
+        "name": "ODL Student Application",
+        "description": "Open and Distance Learning programs for working professionals",
+        "requirements": [
+            "MSCE Certificate with at least 6 credits",
+            "National ID or Passport",
+            "Application Fee of MWK 25,000",
+            "Two passport photos"
+        ],
+        "start_date": "2024-01-01",
+        "end_date": "2024-12-31",
+        "is_active": True
+    },
+    {
+        "id": "2",
+        "name": "Postgraduate Application",
+        "description": "Masters and PhD programs for graduates",
+        "requirements": [
+            "Bachelor's Degree with at least 2:1",
+            "Academic transcripts",
+            "Research proposal",
+            "Two academic referees",
+            "Application Fee of MWK 35,000"
+        ],
+        "start_date": "2024-01-01",
+        "end_date": "2024-12-31",
+        "is_active": True
+    }
+]
+_application_type_counter = 3
+
+# ==================== JWT HELPER FUNCTIONS ====================
 api.add_router("/ml", ml_router)
 api.add_router("/", router)

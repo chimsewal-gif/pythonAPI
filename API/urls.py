@@ -9,14 +9,13 @@ import os
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/', ninja_api.urls),
+    path('api/', ninja_api.urls),  # This now includes all ML endpoints under /api/ml/
     path('predict-admission/', predict_admission_view),
 ]
 
-# Serve media files in development - THIS IS CRITICAL
+# Serve media files
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-    # Alternative method - more explicit
     urlpatterns += [
         path('media/<path:path>', serve, {'document_root': settings.MEDIA_ROOT}),
     ]

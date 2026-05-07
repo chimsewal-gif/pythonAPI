@@ -1,19 +1,22 @@
-# API/ml/endpoints.py
 """
-Separate ML endpoints for admission prediction and deposit slip recognition
+ML Endpoints for Mzuzu University Admission System
+Includes: Admission Prediction, Deposit Slip Recognition, Programme Recommendations
 """
 
 from ninja import Router, Schema, File
 from ninja.files import UploadedFile
 from django.views.decorators.csrf import csrf_exempt
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 from .service import predictor
 from .deposit_slip_recognizer import deposit_slip_recognizer
+from .programme_recommender import get_recommender
 import logging
 import jwt
+import re
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.http import JsonResponse
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,41 @@ class PredictionResponseSchema(Schema):
     probability: Optional[float] = None
     message: Optional[str] = None
     using_ml: Optional[bool] = None
+    error: Optional[str] = None
+
+
+# ============ Programme Recommendation Schemas ============
+class RecommendationRequestSchema(Schema):
+    subjects: List[SubjectGradeSchema]
+    top_n: int = 6
+    programme_type: str = "all"
+
+class ProgrammeRecommendationSchema(Schema):
+    id: int
+    name: str
+    code: Optional[str] = None
+    duration: str
+    type: str
+    fit_score: float
+    admission_probability: float
+    eligibility: str
+    required_subjects: List[str]
+    missing_subjects: List[str]
+    min_points: int
+    required_credits: int
+    quota: int
+    rank: Optional[int] = None
+
+class RecommendationResponseSchema(Schema):
+    success: bool
+    message: str
+    student_stats: Optional[Dict] = None
+    recommendations: List[ProgrammeRecommendationSchema] = []
+    error: Optional[str] = None
+
+class ProgrammeFitResponseSchema(Schema):
+    success: bool
+    prediction: Optional[Dict] = None
     error: Optional[str] = None
 
 
@@ -128,9 +166,12 @@ def predict_admission(request, data: PredictionInputSchema):
 @ml_router.get("/health/", response={200: dict})
 def ml_health_check(request):
     """Check if ML service is available"""
+    recommender = get_recommender()
     return 200, {
         "success": True,
         "ml_available": predictor.model_loaded,
+        "programme_recommender_loaded": recommender is not None,
+        "programmes_count": len(recommender.programmes_df) if recommender and recommender.programmes_df is not None else 0,
         "message": "ML service is running" if predictor.model_loaded else "ML service running in fallback mode"
     }
 
@@ -161,6 +202,167 @@ def batch_predict_admission(request, data: List[PredictionInputSchema]):
         return 400, {
             "success": False,
             "error": f"Batch prediction failed: {str(e)}"
+        }
+
+
+# ============ Programme Recommendation Endpoints ============
+@csrf_exempt
+@ml_router.post("/recommend-programmes", response={200: RecommendationResponseSchema, 400: dict})
+@ml_router.post("/recommend-programmes/", response={200: RecommendationResponseSchema, 400: dict})
+def recommend_programmes(request, data: RecommendationRequestSchema):
+    """
+    Get programme recommendations based on student's MSCE results
+    """
+    try:
+        user = get_user_from_request(request)
+        if user:
+            logger.info(f"Programme recommendation request from user {user.id}")
+        
+        subjects = [{'subject': s.subject, 'grade': s.grade} for s in data.subjects]
+        
+        if not subjects:
+            return 200, {
+                "success": False,
+                "message": "No subjects provided",
+                "recommendations": []
+            }
+        
+        recommender = get_recommender()
+        recommendations = recommender.recommend_programmes(
+            subjects=subjects,
+            top_n=data.top_n,
+            programme_type=data.programme_type
+        )
+        
+        # Ensure all recommendations have proper types
+        clean_recommendations = []
+        for rec in recommendations:
+            clean_rec = {
+                "id": int(rec["id"]),
+                "name": str(rec["name"]),
+                "code": str(rec.get("code", "")) if rec.get("code") and str(rec.get("code")) != "nan" else "",
+                "duration": str(rec.get("duration", "N/A")),
+                "type": str(rec.get("type", "generic")),
+                "fit_score": float(rec["fit_score"]),
+                "admission_probability": float(rec["admission_probability"]),
+                "eligibility": str(rec["eligibility"]),
+                "required_subjects": [str(s) for s in rec.get("required_subjects", [])],
+                "missing_subjects": [str(s) for s in rec.get("missing_subjects", [])],
+                "min_points": int(rec.get("min_points", 30)),
+                "required_credits": int(rec.get("required_credits", 4)),
+                "quota": int(rec.get("quota", 0)) if rec.get("quota") and str(rec.get("quota")) != "nan" else 0,
+                "rank": int(rec.get("rank", 0)) if rec.get("rank") else None
+            }
+            clean_recommendations.append(clean_rec)
+        
+        # Calculate average points
+        avg_points = 0
+        best_grade = 9
+        if subjects:
+            points_list = [recommender.grade_points.get(str(s['grade']).upper(), 9) for s in subjects]
+            avg_points = sum(points_list) / len(points_list)
+            best_grade = min(points_list)
+        
+        return 200, {
+            "success": True,
+            "message": f"Found {len(clean_recommendations)} programme recommendations",
+            "student_stats": {
+                "subjects_count": len(subjects),
+                "average_points": round(avg_points, 2),
+                "best_grade": best_grade
+            },
+            "recommendations": clean_recommendations
+        }
+        
+    except Exception as e:
+        logger.error(f"Programme recommendation error: {str(e)}", exc_info=True)
+        return 400, {
+            "success": False,
+            "message": "Failed to generate recommendations",
+            "error": str(e),
+            "recommendations": []
+        }
+    
+
+@csrf_exempt
+@ml_router.post("/predict-programme-fit/{programme_id}", response={200: ProgrammeFitResponseSchema, 400: dict})
+@ml_router.post("/predict-programme-fit/{programme_id}/", response={200: ProgrammeFitResponseSchema, 400: dict})
+def predict_programme_fit(request, programme_id: int, data: PredictionInputSchema):
+    """
+    Predict how well a student fits a specific programme
+    Returns detailed fit analysis including subject requirements and points check
+    """
+    try:
+        user = get_user_from_request(request)
+        if user:
+            logger.info(f"Programme fit prediction request for programme {programme_id} from user {user.id}")
+        
+        subjects = [{'subject': s.subject, 'grade': s.grade} for s in data.subjects]
+        
+        if not subjects:
+            return 400, {
+                "success": False,
+                "error": "No subjects provided"
+            }
+        
+        recommender = get_recommender()
+        prediction = recommender.predict_admission_probability(programme_id, subjects)
+        
+        if prediction.get("error"):
+            return 400, {
+                "success": False,
+                "error": prediction["error"]
+            }
+        
+        return 200, {
+            "success": True,
+            "prediction": prediction
+        }
+        
+    except Exception as e:
+        logger.error(f"Programme fit prediction error: {str(e)}", exc_info=True)
+        return 400, {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@csrf_exempt
+@ml_router.get("/eligible-programmes", response={200: dict, 400: dict})
+@ml_router.get("/eligible-programmes/", response={200: dict, 400: dict})
+def get_eligible_programmes(request):
+    """
+    Get all programmes with eligibility criteria
+    Useful for frontend to display available programmes
+    """
+    try:
+        recommender = get_recommender()
+        programmes = []
+        
+        for _, prog in recommender.programmes_df.iterrows():
+            programmes.append({
+                "id": int(prog['id']),
+                "name": prog['name'],
+                "code": prog.get('code', ''),
+                "duration": prog['duration'],
+                "type": prog.get('type', 'generic'),
+                "required_subjects": prog.get('subjects', []),
+                "min_points": prog.get('min_points', 30),
+                "required_credits": prog.get('required_credits', 4),
+                "quota": prog.get('quota', 0)
+            })
+        
+        return 200, {
+            "success": True,
+            "count": len(programmes),
+            "programmes": programmes
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching programmes: {str(e)}", exc_info=True)
+        return 400, {
+            "success": False,
+            "error": str(e)
         }
 
 
@@ -351,8 +553,6 @@ def extract_text_only(request, deposit_slip: UploadedFile = File(...)):
 
 
 # ============ Document Classification Endpoints ============
-# API/ml/endpoints.py - Updated classify_document function
-
 @csrf_exempt
 @ml_router.post("/classify-document/", response={200: dict, 400: dict, 422: dict})
 @ml_router.post("/classify-document", response={200: dict, 400: dict, 422: dict})
@@ -401,9 +601,6 @@ def classify_document(request):
     
     try:
         # Use OCR to analyze the actual content of the file
-        from .deposit_slip_recognizer import deposit_slip_recognizer
-        
-        # Process the file with OCR
         recognition_result = deposit_slip_recognizer.recognize(file)
         
         document_type = "unknown"
@@ -429,7 +626,7 @@ def classify_document(request):
                 "has_bank": has_bank
             }
             
-            # Check for NBS Bank specifically (from your image)
+            # Check for NBS Bank specifically
             raw_text = recognition_result.get('raw_text_preview', '').lower()
             
             # Keywords that indicate a bank deposit slip
@@ -439,18 +636,18 @@ def classify_document(request):
                 'ecobank', 'mybucks', 'opportunity bank'
             ]
             
-            # Check for specific pattern from your image
+            # Check for specific pattern
             is_deposit_slip = (
                 any(kw in raw_text for kw in deposit_slip_keywords) and
                 (has_reference or has_amount or has_bank)
             )
             
-            # Specific patterns from your NBS deposit slip
+            # Specific patterns for NBS deposit slip
             nbs_patterns = [
                 r'nbs\s*bank',
                 r'cash\s*deposit\s*slip',
                 r'bic\s*f\s*d',
-                r'account\s*name:\s*hiza',
+                r'account\s*name:',
                 r'11224',
                 r'12332057'
             ]
@@ -533,7 +730,7 @@ def classify_document(request):
             "confidence": 0,
             "is_valid": False
         }
-    
+
 
 @csrf_exempt
 @ml_router.post("/validate-document/", response={200: dict, 400: dict, 422: dict})
@@ -596,7 +793,6 @@ def validate_document(request):
 
 
 # ============ Submission Prediction Endpoint ============
-
 class SubmissionPredictionResponseSchema(Schema):
     success: bool
     decision: str  # 'approve', 'reject', 'review'
@@ -622,6 +818,7 @@ def predict_submission(request, submission_id: int):
         if user:
             logger.info(f"Prediction request for submission {submission_id} from user {user.id}")
         
+        # Import models - adjust import path as needed
         from API.models import Applicant, SubjectRecord
         
         # Get the applicant
@@ -638,18 +835,7 @@ def predict_submission(request, submission_id: int):
         
         # Extract subjects and grades
         subjects = []
-        for record in subject_records:
-            subjects.append({
-                'subject': record.subject,
-                'grade': record.grade
-            })
-        
-        # Get programme info if selected
-        programme_name = applicant.selected_programme_name or applicant.program or "Not specified"
-        
-        # Calculate basic metrics
-        total_subjects = len(subjects)
-        grade_points = []
+        grade_points_list = []
         
         # Grade to point conversion (MSCE)
         grade_to_points = {
@@ -658,12 +844,22 @@ def predict_submission(request, submission_id: int):
         }
         
         for record in subject_records:
+            subjects.append({
+                'subject': record.subject,
+                'grade': record.grade
+            })
             points = grade_to_points.get(record.grade, 5)
-            grade_points.append(points)
+            grade_points_list.append(points)
+        
+        # Get programme info if selected
+        programme_name = getattr(applicant, 'selected_programme_name', None) or getattr(applicant, 'program', "Not specified")
+        
+        # Calculate basic metrics
+        total_subjects = len(subjects)
         
         # Calculate average points and determine strength
-        if grade_points:
-            average_points = sum(grade_points) / len(grade_points)
+        if grade_points_list:
+            average_points = sum(grade_points_list) / len(grade_points_list)
         else:
             average_points = 5
         
@@ -756,7 +952,7 @@ def predict_submission(request, submission_id: int):
             "factors": factors,
             "recommendation": recommendation,
             "priority_level": priority_level,
-            "message": f"Prediction completed for {applicant.first_name} {applicant.last_name}"
+            "message": f"Prediction completed for {getattr(applicant, 'first_name', 'Applicant')} {getattr(applicant, 'last_name', '')}"
         }
         
     except Exception as e:
@@ -771,3 +967,7 @@ def predict_submission(request, submission_id: int):
             "recommendation": "Unable to generate prediction due to an error.",
             "priority_level": "Medium"
         }
+
+
+# Add this at the very end of API/ml/endpoints.py
+router = ml_router  # Create alias for backward compatibility

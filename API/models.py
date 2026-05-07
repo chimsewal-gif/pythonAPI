@@ -73,6 +73,12 @@ class Applicant(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     reference_number = models.CharField(max_length=100, blank=True, null=True, unique=True)
     
+    # Rejection reason field (used in analytics)
+    rejection_reason = models.TextField(blank=True, null=True, help_text="Reason for rejection if status is rejected")
+    
+    # Auto-processed field (used in processing stats)
+    auto_processed = models.BooleanField(default=False, help_text="Whether this application was auto-processed by ML")
+    
     # Document fields
     msce = models.CharField(max_length=500, blank=True, null=True)
     msce_size = models.IntegerField(blank=True, null=True)
@@ -691,7 +697,7 @@ class UserProfileSettings(models.Model):
 
 
 class AuditLog(models.Model):
-    """Audit log for sensitive actions"""
+    """Audit log for sensitive actions - Compatible with both existing and new API endpoints"""
     ACTION_CHOICES = [
         ('login', 'Login'),
         ('logout', 'Logout'),
@@ -701,12 +707,16 @@ class AuditLog(models.Model):
         ('session_logout', 'Session Logout'),
         ('settings_update', 'Settings Update'),
         ('data_export', 'Data Export'),
+        ('backup_created', 'Backup Created'),
+        ('user_deletion', 'User Deletion'),
+        ('role_update', 'Role Update'),
     ]
     
-    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='audit_logs')
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='audit_log_entries')
     action = models.CharField(max_length=100, choices=ACTION_CHOICES)
     resource_type = models.CharField(max_length=100, blank=True, null=True)
     resource_id = models.IntegerField(blank=True, null=True)
+    details = models.TextField(blank=True, null=True)
     old_value = models.TextField(blank=True, null=True)
     new_value = models.TextField(blank=True, null=True)
     ip_address = models.GenericIPAddressField(blank=True, null=True)
