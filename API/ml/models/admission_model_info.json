@@ -1,0 +1,18 @@
+{
+  "model_type": "Random Forest",
+  "accuracy": 1.0,
+  "roc_auc": 1.0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1_score": 1.0,
+  "features": [
+    "subjects_count",
+    "total_points",
+    "programme_id",
+    "points_per_subject",
+    "above_min_credits",
+    "points_within_limit"
+  ],
+  "training_samples": 400,
+  "test_samples": 100
+}

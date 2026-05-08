@@ -16,6 +16,11 @@ from django.core.files.base import ContentFile
 from .ml.endpoints import ml_router
 from django.db import IntegrityError
 
+# Add these imports at the top
+from .ml.admission_predictor import admission_predictor
+from django.db.models import Count, Q
+
+
 from django.http import FileResponse
 
 from datetime import datetime, timedelta, timezone
@@ -56,6 +61,33 @@ class DocumentResponseSchema(Schema):
     data: Optional[DocumentUploadSchema] = None
 
 # Add these schema definitions with your other schemas (near line 100-150)
+
+
+
+# Add these schemas
+class BatchPredictionSchema(Schema):
+    applicant_ids: List[int]
+
+class PredictionResponseSchema(Schema):
+    success: bool
+    applicant_id: int
+    applicant_name: str
+    probability: float
+    priority: str
+    priority_level: str
+    priority_color: str
+    priority_icon: str
+    confidence: float
+    factors: List[dict]
+    recommendation: str
+    error: Optional[str] = None
+
+class BatchPredictionResponseSchema(Schema):
+    success: bool
+    results: List[PredictionResponseSchema]
+    summary: dict
+
+    
 
 class ApplicationTypeSchema(Schema):
     name: str
@@ -7411,6 +7443,351 @@ _application_types = [
     }
 ]
 _application_type_counter = 3
+
+
+
+
+# Add these endpoints after your existing endpoints
+
+@router.post("/ml/predict-admission/{applicant_id}")
+@router.post("/ml/predict-admission/{applicant_id}/")
+def predict_single_admission(request, applicant_id: int):
+    """Predict admission probability and priority for a single applicant"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Get applicant data
+        try:
+            applicant = Applicant.objects.get(id=applicant_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "error": f"Applicant with ID {applicant_id} not found"
+            }
+        
+        # Gather all required data for prediction
+        user_obj = applicant.user
+        
+        # Get subject records
+        subject_records = SubjectRecord.objects.filter(user=user_obj)
+        
+        # Get next of kin count
+        next_of_kin_count = NextOfKin.objects.filter(user=user_obj).count()
+        
+        # Get programme choices
+        programme_choices = ProgrammeChoice.objects.filter(user=user_obj)
+        
+        # Get programme competition (count applicants for chosen programme)
+        first_choice = programme_choices.first()
+        programme_applicants_count = 1
+        programme_capacity = 50
+        
+        if first_choice:
+            programme_applicants_count = Applicant.objects.filter(
+                Q(selected_programme_id=first_choice.programme_id) |
+                Q(selected_programme_name=first_choice.programme_name)
+            ).count()
+            try:
+                prog = Programme.objects.get(id=first_choice.programme_id)
+                programme_capacity = prog.quota or 50
+            except:
+                programme_capacity = 50
+        
+        # Build applicant data for prediction
+        applicant_data = {
+            'subject_records': [{'qualification': r.qualification, 'subject': r.subject, 'grade': r.grade} for r in subject_records],
+            'subject_records_count': subject_records.count(),
+            'next_of_kin_count': next_of_kin_count,
+            'programme_choices_count': programme_choices.count(),
+            'programme_applicants_count': programme_applicants_count,
+            'programme_capacity': programme_capacity,
+            'msce_year': subject_records.first().year if subject_records.exists() else datetime.now().year,
+            'personal_details_complete': bool(applicant.first_name and applicant.last_name and applicant.email),
+            'documents_uploaded': bool(applicant.msce and applicant.id_card),
+            'fee_paid': bool(applicant.payment_proof),
+            'highest_education': 'msce'  # You can enhance this based on education records
+        }
+        
+        # Get prediction
+        prediction = admission_predictor.predict(applicant_data)
+        
+        # Store prediction in database for future reference
+        applicant.ml_decision = prediction.get('priority', 'Medium').lower()
+        applicant.ml_confidence = prediction.get('confidence', 0.5)
+        applicant.ml_probability = prediction.get('probability', 0.5)
+        applicant.ml_priority = prediction.get('priority', 'Medium')
+        applicant.ml_factors = {'factors': prediction.get('factors', [])}
+        applicant.ml_recommendation = prediction.get('recommendation', '')
+        applicant.ml_processed_at = datetime.now()
+        applicant.save()
+        
+        return {
+            "success": True,
+            "data": {
+                "applicant_id": applicant.id,
+                "applicant_name": f"{applicant.first_name} {applicant.last_name}",
+                "probability": prediction.get('probability', 0.5),
+                "priority": prediction.get('priority', 'Medium'),
+                "priority_level": prediction.get('priority', 'Medium'),
+                "priority_color": prediction.get('priority_color', 'yellow'),
+                "priority_icon": prediction.get('priority_icon', '⭐'),
+                "confidence": prediction.get('confidence', 0.5),
+                "factors": prediction.get('factors', []),
+                "recommendation": prediction.get('recommendation', ''),
+                "using_ml": prediction.get('using_ml', False)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Prediction error: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.post("/ml/batch-predict-admissions")
+@router.post("/ml/batch-predict-admissions/")
+def batch_predict_admissions(request, data: BatchPredictionSchema):
+    """Batch predict admission probabilities for multiple applicants"""
+    try:
+        user = get_user_from_token(request)
+        
+        results = []
+        high_priority = 0
+        medium_priority = 0
+        low_priority = 0
+        
+        for applicant_id in data.applicant_ids:
+            try:
+                # Call single prediction endpoint logic
+                applicant = Applicant.objects.get(id=applicant_id)
+                user_obj = applicant.user
+                
+                subject_records = SubjectRecord.objects.filter(user=user_obj)
+                next_of_kin_count = NextOfKin.objects.filter(user=user_obj).count()
+                programme_choices = ProgrammeChoice.objects.filter(user=user_obj)
+                
+                first_choice = programme_choices.first()
+                programme_applicants_count = 1
+                programme_capacity = 50
+                
+                if first_choice:
+                    programme_applicants_count = Applicant.objects.filter(
+                        Q(selected_programme_id=first_choice.programme_id) |
+                        Q(selected_programme_name=first_choice.programme_name)
+                    ).count()
+                    try:
+                        prog = Programme.objects.get(id=first_choice.programme_id)
+                        programme_capacity = prog.quota or 50
+                    except:
+                        programme_capacity = 50
+                
+                applicant_data = {
+                    'subject_records': [{'qualification': r.qualification, 'subject': r.subject, 'grade': r.grade} for r in subject_records],
+                    'subject_records_count': subject_records.count(),
+                    'next_of_kin_count': next_of_kin_count,
+                    'programme_choices_count': programme_choices.count(),
+                    'programme_applicants_count': programme_applicants_count,
+                    'programme_capacity': programme_capacity,
+                    'msce_year': subject_records.first().year if subject_records.exists() else datetime.now().year,
+                    'personal_details_complete': bool(applicant.first_name and applicant.last_name and applicant.email),
+                    'documents_uploaded': bool(applicant.msce and applicant.id_card),
+                    'fee_paid': bool(applicant.payment_proof),
+                    'highest_education': 'msce'
+                }
+                
+                prediction = admission_predictor.predict(applicant_data)
+                
+                # Update counts
+                priority = prediction.get('priority', 'Medium')
+                if priority == 'High':
+                    high_priority += 1
+                elif priority == 'Medium':
+                    medium_priority += 1
+                else:
+                    low_priority += 1
+                
+                # Store in database
+                applicant.ml_decision = priority.lower()
+                applicant.ml_confidence = prediction.get('confidence', 0.5)
+                applicant.ml_probability = prediction.get('probability', 0.5)
+                applicant.ml_priority = priority
+                applicant.ml_factors = {'factors': prediction.get('factors', [])}
+                applicant.ml_recommendation = prediction.get('recommendation', '')
+                applicant.ml_processed_at = datetime.now()
+                applicant.save()
+                
+                results.append({
+                    "success": True,
+                    "applicant_id": applicant.id,
+                    "applicant_name": f"{applicant.first_name} {applicant.last_name}",
+                    "probability": prediction.get('probability', 0.5),
+                    "priority": priority,
+                    "priority_level": priority,
+                    "priority_color": prediction.get('priority_color', 'yellow'),
+                    "priority_icon": prediction.get('priority_icon', '⭐'),
+                    "confidence": prediction.get('confidence', 0.5),
+                    "factors": prediction.get('factors', []),
+                    "recommendation": prediction.get('recommendation', '')
+                })
+                
+            except Exception as e:
+                results.append({
+                    "success": False,
+                    "applicant_id": applicant_id,
+                    "error": str(e)
+                })
+        
+        return {
+            "success": True,
+            "results": results,
+            "summary": {
+                "total": len(data.applicant_ids),
+                "high_priority": high_priority,
+                "medium_priority": medium_priority,
+                "low_priority": low_priority,
+                "successful": len([r for r in results if r.get('success')])
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Batch prediction error: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.get("/ml/predictions/priority/{priority_level}")
+@router.get("/ml/predictions/priority/{priority_level}/")
+def get_predictions_by_priority(request, priority_level: str):
+    """Get all applicants with a specific priority level"""
+    try:
+        user = get_user_from_token(request)
+        
+        if priority_level not in ['High', 'Medium', 'Low']:
+            return {
+                "success": False,
+                "error": "Priority level must be High, Medium, or Low"
+            }
+        
+        applicants = Applicant.objects.filter(
+            ml_priority=priority_level,
+            status='submitted'
+        ).order_by('-ml_probability')
+        
+        results = []
+        for applicant in applicants:
+            results.append({
+                "id": applicant.id,
+                "name": f"{applicant.first_name} {applicant.last_name}",
+                "email": applicant.email,
+                "programme": applicant.selected_programme_name or applicant.program,
+                "probability": applicant.ml_probability,
+                "priority": applicant.ml_priority,
+                "confidence": applicant.ml_confidence,
+                "submitted_at": applicant.application_date.isoformat() if applicant.application_date else None
+            })
+        
+        return {
+            "success": True,
+            "priority_level": priority_level,
+            "count": len(results),
+            "applicants": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching predictions: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.get("/ml/predictions/dashboard")
+@router.get("/ml/predictions/dashboard/")
+def get_prediction_dashboard(request):
+    """Get ML prediction dashboard statistics"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Get all applicants with predictions
+        applicants_with_ml = Applicant.objects.filter(ml_decision__isnull=False)
+        
+        priority_counts = {
+            'High': applicants_with_ml.filter(ml_priority='High').count(),
+            'Medium': applicants_with_ml.filter(ml_priority='Medium').count(),
+            'Low': applicants_with_ml.filter(ml_priority='Low').count()
+        }
+        
+        # Average probability by priority
+        avg_probabilities = {}
+        for priority in ['High', 'Medium', 'Low']:
+            avg = applicants_with_ml.filter(ml_priority=priority).aggregate(Avg('ml_probability'))['ml_probability__avg']
+            avg_probabilities[priority] = avg or 0
+        
+        # Recent predictions
+        recent_predictions = applicants_with_ml.order_by('-ml_processed_at')[:10]
+        recent = []
+        for applicant in recent_predictions:
+            recent.append({
+                "id": applicant.id,
+                "name": f"{applicant.first_name} {applicant.last_name}",
+                "priority": applicant.ml_priority,
+                "probability": applicant.ml_probability,
+                "predicted_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None
+            })
+        
+        return {
+            "success": True,
+            "data": {
+                "total_predicted": applicants_with_ml.count(),
+                "priority_distribution": priority_counts,
+                "average_probabilities": avg_probabilities,
+                "recent_predictions": recent,
+                "model_info": admission_predictor.get_model_info()
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching dashboard: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.post("/ml/train-model")
+@router.post("/ml/train-model/")
+def train_prediction_model(request):
+    """Train or retrain the ML model (admin only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Check if admin (you can enhance this check)
+        try:
+            applicant = Applicant.objects.get(user=user)
+            if applicant.program not in ['admin', 'administrator', 'staff']:
+                return {
+                    "success": False,
+                    "error": "Admin access required"
+                }
+        except:
+            pass
+        
+        # Train model using historical data
+        result = admission_predictor.train_model()
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Training error: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+    
 
 # ==================== JWT HELPER FUNCTIONS ====================
 api.add_router("/ml", ml_router)
