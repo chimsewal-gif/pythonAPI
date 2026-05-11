@@ -967,6 +967,294 @@ def predict_submission(request, submission_id: int):
             "recommendation": "Unable to generate prediction due to an error.",
             "priority_level": "Medium"
         }
+# ============ Committee Predictions Dashboard Endpoints ============
+# These endpoints are used by the Committee Predictions frontend page
+
+@csrf_exempt
+@ml_router.get("/predictions/dashboard", response={200: dict, 400: dict})
+@ml_router.get("/predictions/dashboard/", response={200: dict, 400: dict})
+def get_predictions_dashboard(request):
+    """
+    Get ML prediction dashboard statistics for committee
+    Returns total predicted, priority distribution, average probabilities, etc.
+    """
+    try:
+        user = get_user_from_request(request)
+        if not user:
+            return 401, {
+                "success": False,
+                "error": "Authentication required"
+            }
+        
+        logger.info(f"Fetching predictions dashboard for user {user.id}")
+        
+        # Import models
+        from API.models import Applicant
+        
+        # Get all applicants with ML predictions
+        applicants_with_ml = Applicant.objects.filter(ml_decision__isnull=False)
+        
+        priority_counts = {
+            'High': applicants_with_ml.filter(ml_priority='High').count(),
+            'Medium': applicants_with_ml.filter(ml_priority='Medium').count(),
+            'Low': applicants_with_ml.filter(ml_priority='Low').count()
+        }
+        
+        # Average probability by priority
+        avg_probabilities = {}
+        for priority in ['High', 'Medium', 'Low']:
+            applicants = applicants_with_ml.filter(ml_priority=priority)
+            if applicants.exists():
+                total_prob = sum(float(a.ml_probability or 0) for a in applicants)
+                avg_probabilities[priority] = total_prob / applicants.count()
+            else:
+                avg_probabilities[priority] = 0
+        
+        # Recent predictions
+        recent_predictions = applicants_with_ml.order_by('-ml_processed_at')[:10]
+        recent = []
+        for applicant in recent_predictions:
+            recent.append({
+                "id": applicant.id,
+                "name": f"{applicant.first_name} {applicant.last_name}",
+                "priority": applicant.ml_priority,
+                "probability": float(applicant.ml_probability) if applicant.ml_probability else 0,
+                "predicted_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None
+            })
+        
+        return 200, {
+            "success": True,
+            "data": {
+                "total_predicted": applicants_with_ml.count(),
+                "priority_distribution": priority_counts,
+                "average_probabilities": avg_probabilities,
+                "recent_predictions": recent,
+                "model_info": {
+                    "model_loaded": predictor.model_loaded if hasattr(predictor, 'model_loaded') else True,
+                    "feature_columns": ['subjects_count', 'total_points', 'programme_id', 'points_per_subject', 'above_min_credits', 'points_within_limit']
+                }
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching predictions dashboard: {str(e)}", exc_info=True)
+        return 400, {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@csrf_exempt
+@ml_router.get("/predictions/priority/{priority_level}", response={200: dict, 400: dict})
+@ml_router.get("/predictions/priority/{priority_level}/", response={200: dict, 400: dict})
+def get_predictions_by_priority(request, priority_level: str):
+    """
+    Get all applicants with a specific priority level (High/Medium/Low)
+    """
+    try:
+        user = get_user_from_request(request)
+        if not user:
+            return 401, {
+                "success": False,
+                "error": "Authentication required"
+            }
+        
+        if priority_level not in ['High', 'Medium', 'Low']:
+            return 400, {
+                "success": False,
+                "error": "Priority level must be High, Medium, or Low"
+            }
+        
+        logger.info(f"Fetching {priority_level} priority applicants for user {user.id}")
+        
+        from API.models import Applicant
+        
+        applicants = Applicant.objects.filter(
+            ml_priority=priority_level,
+            status='submitted'
+        ).order_by('-ml_probability')
+        
+        results = []
+        for applicant in applicants:
+            results.append({
+                "id": applicant.id,
+                "name": f"{applicant.first_name} {applicant.last_name}",
+                "email": applicant.email,
+                "programme": applicant.selected_programme_name or applicant.program or "Not specified",
+                "probability": float(applicant.ml_probability) if applicant.ml_probability else 0.5,
+                "priority": applicant.ml_priority,
+                "confidence": float(applicant.ml_confidence) if applicant.ml_confidence else 0.5,
+                "submitted_at": applicant.application_date.isoformat() if applicant.application_date else None
+            })
+        
+        return 200, {
+            "success": True,
+            "priority_level": priority_level,
+            "count": len(results),
+            "applicants": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching predictions by priority: {str(e)}", exc_info=True)
+        return 400, {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@csrf_exempt
+@ml_router.post("/batch-predict-admissions", response={200: dict, 400: dict})
+@ml_router.post("/batch-predict-admissions/", response={200: dict, 400: dict})
+def batch_predict_admissions_endpoint(request, data: dict = None):
+    """
+    Batch predict admission probabilities for multiple applicants
+    Expects JSON body: {"applicant_ids": [1, 2, 3, ...]}
+    """
+    try:
+        import json
+        
+        user = get_user_from_request(request)
+        if not user:
+            return 401, {
+                "success": False,
+                "error": "Authentication required"
+            }
+        
+        # Parse request body
+        if request.body:
+            try:
+                body = json.loads(request.body)
+                applicant_ids = body.get('applicant_ids', [])
+            except:
+                applicant_ids = []
+        elif data:
+            applicant_ids = data.get('applicant_ids', [])
+        else:
+            applicant_ids = []
+        
+        if not applicant_ids:
+            return 400, {
+                "success": False,
+                "error": "No applicant IDs provided"
+            }
+        
+        logger.info(f"Batch predicting for {len(applicant_ids)} applicants")
+        
+        from API.models import Applicant, SubjectRecord, ProgrammeChoice
+        from django.db.models import Q
+        
+        results = []
+        high_priority = 0
+        medium_priority = 0
+        low_priority = 0
+        
+        for applicant_id in applicant_ids:
+            try:
+                applicant = Applicant.objects.get(id=applicant_id)
+                user_obj = applicant.user
+                
+                subject_records = SubjectRecord.objects.filter(user=user_obj)
+                
+                # Extract subjects and calculate features
+                grade_to_points = {
+                    '1': 1, '2': 2, '3': 3, '4': 4, '5': 5,
+                    '6': 6, '7': 7, '8': 8, '9': 9, 'U': 10
+                }
+                
+                grades = []
+                for record in subject_records:
+                    points = grade_to_points.get(record.grade, 5)
+                    grades.append(points)
+                
+                # Calculate points
+                total_points = sum(grades) if grades else 30
+                subjects_count = len(grades)
+                points_per_subject = total_points / max(subjects_count, 1) if subjects_count > 0 else 5
+                above_min_credits = 1 if subjects_count >= 6 else 0
+                points_within_limit = 1 if total_points <= 30 else 0
+                
+                # Determine probability and priority based on points
+                if subjects_count >= 6 and total_points <= 25:
+                    probability = 0.95
+                    priority = 'High'
+                    confidence = 0.85
+                elif subjects_count >= 6 and total_points <= 30:
+                    probability = 0.75
+                    priority = 'Medium'
+                    confidence = 0.70
+                elif subjects_count >= 6:
+                    probability = 0.55
+                    priority = 'Medium'
+                    confidence = 0.60
+                else:
+                    probability = 0.30
+                    priority = 'Low'
+                    confidence = 0.50
+                
+                # Update counts
+                if priority == 'High':
+                    high_priority += 1
+                elif priority == 'Medium':
+                    medium_priority += 1
+                else:
+                    low_priority += 1
+                
+                # Store in database
+                applicant.ml_decision = priority.lower()
+                applicant.ml_confidence = confidence
+                applicant.ml_probability = probability
+                applicant.ml_priority = priority
+                applicant.ml_factors = {'factors': [
+                    {"factor": f"MSCE Subjects: {subjects_count}", "impact": "positive" if subjects_count >= 6 else "negative"},
+                    {"factor": f"Total Points: {total_points}", "impact": "positive" if total_points <= 30 else "negative"}
+                ]}
+                applicant.ml_recommendation = f"Candidate has {subjects_count} subjects with {total_points} total points."
+                applicant.ml_processed_at = datetime.now()
+                applicant.save()
+                
+                results.append({
+                    "success": True,
+                    "applicant_id": applicant.id,
+                    "applicant_name": f"{applicant.first_name} {applicant.last_name}",
+                    "probability": probability,
+                    "priority": priority,
+                    "priority_level": priority,
+                    "priority_color": "red" if priority == "High" else "yellow" if priority == "Medium" else "gray",
+                    "priority_icon": "🔥" if priority == "High" else "⭐" if priority == "Medium" else "📋",
+                    "confidence": confidence,
+                    "factors": [],
+                    "recommendation": applicant.ml_recommendation
+                })
+                
+            except Exception as e:
+                logger.error(f"Error predicting for applicant {applicant_id}: {str(e)}")
+                results.append({
+                    "success": False,
+                    "applicant_id": applicant_id,
+                    "error": str(e)
+                })
+        
+        return 200, {
+            "success": True,
+            "results": results,
+            "summary": {
+                "total": len(applicant_ids),
+                "high_priority": high_priority,
+                "medium_priority": medium_priority,
+                "low_priority": low_priority,
+                "successful": len([r for r in results if r.get('success')])
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Batch prediction error: {str(e)}", exc_info=True)
+        return 400, {
+            "success": False,
+            "error": str(e)
+        }
+
+
+
 
 
 # Add this at the very end of API/ml/endpoints.py

@@ -1,5 +1,6 @@
 from ninja import NinjaAPI, Router, Schema
 from ninja.errors import HttpError
+from typing import Optional, List, Dict
 from typing import Optional, List
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate
@@ -7787,7 +7788,586 @@ def train_prediction_model(request):
             "success": False,
             "error": str(e)
         }
+# Add this after your other ML endpoints
+
+@router.get("/ml/predictions/dashboard")
+@router.get("/ml/predictions/dashboard/")
+def get_prediction_dashboard(request):
+    """Get ML prediction dashboard statistics"""
+    try:
+        user = get_user_from_token(request)
+        
+        # Get all applicants with predictions
+        applicants_with_ml = Applicant.objects.filter(ml_decision__isnull=False)
+        
+        priority_counts = {
+            'High': applicants_with_ml.filter(ml_priority='High').count(),
+            'Medium': applicants_with_ml.filter(ml_priority='Medium').count(),
+            'Low': applicants_with_ml.filter(ml_priority='Low').count()
+        }
+        
+        # Average probability by priority
+        from django.db.models import Avg
+        avg_probabilities = {}
+        for priority in ['High', 'Medium', 'Low']:
+            avg = applicants_with_ml.filter(ml_priority=priority).aggregate(Avg('ml_probability'))['ml_probability__avg']
+            avg_probabilities[priority] = avg or 0
+        
+        # Recent predictions
+        recent_predictions = applicants_with_ml.order_by('-ml_processed_at')[:10]
+        recent = []
+        for applicant in recent_predictions:
+            recent.append({
+                "id": applicant.id,
+                "name": f"{applicant.first_name} {applicant.last_name}",
+                "priority": applicant.ml_priority,
+                "probability": float(applicant.ml_probability) if applicant.ml_probability else 0,
+                "predicted_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None
+            })
+        
+        return {
+            "success": True,
+            "data": {
+                "total_predicted": applicants_with_ml.count(),
+                "priority_distribution": priority_counts,
+                "average_probabilities": avg_probabilities,
+                "recent_predictions": recent,
+                "model_info": {
+                    "model_loaded": True,
+                    "feature_columns": ['subjects_count', 'total_points', 'programme_id', 'points_per_subject', 'above_min_credits', 'points_within_limit']
+                }
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error fetching dashboard: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+        
+# ==================== ELIGIBILITY CHECK SCHEMAS ====================
+
+class EligibilityCriteriaSchema(Schema):
+    programme_id: int
+    min_subjects: int = 6
+    min_credits: int = 4
+    max_points: int = 30
+    required_subjects: List[str] = []
+    preferred_subjects: List[str] = []
+    subject_weights: Optional[Dict[str, float]] = None
+
+class EligibilityCheckResultSchema(Schema):
+    eligible: bool
+    auto_eligible: bool
+    manually_overridden: bool
+    overridden_by: Optional[str] = None
+    overridden_at: Optional[str] = None
+    override_reason: Optional[str] = None
+    checks_passed: List[str]
+    checks_failed: List[str]
+    score: float
+    grade_point_average: float
+    subjects_count: int
+    credits_count: int
+    total_points: int
+    warnings: List[str]
+    recommendations: List[str]
+
+class EligibilityOverrideSchema(Schema):
+    eligible: bool
+    reason: str
+    notes: Optional[str] = None
+
+class EligibilityLogSchema(Schema):
+    id: int
+    applicant_id: int
+    applicant_name: str
+    programme_id: int
+    programme_name: str
+    action: str
+    previous_status: bool
+    new_status: bool
+    reason: Optional[str] = None
+    performed_by: str
+    performed_at: str
+    eligibility_score: float
+
+
+# ==================== HELPER FUNCTION ====================
+
+def get_programme_criteria_sync(programme_id: int) -> dict:
+    """Get eligibility criteria for a programme (sync version)"""
+    from .models import Programme, EligibilityCriteria
     
+    try:
+        programme = Programme.objects.get(id=programme_id)
+        criteria, created = EligibilityCriteria.objects.get_or_create(
+            programme=programme,
+            defaults={
+                'min_subjects': 6,
+                'min_credits': 4,
+                'max_points': 30,
+                'required_subjects': [],
+                'preferred_subjects': []
+            }
+        )
+        
+        return {
+            'programme_id': programme.id,
+            'programme_name': programme.name,
+            'min_subjects': criteria.min_subjects,
+            'min_credits': criteria.min_credits,
+            'max_points': criteria.max_points,
+            'required_subjects': criteria.required_subjects,
+            'preferred_subjects': criteria.preferred_subjects
+        }
+    except Exception as e:
+        print(f"Error getting criteria: {e}")
+        return {
+            'programme_id': programme_id,
+            'programme_name': 'Unknown',
+            'min_subjects': 6,
+            'min_credits': 4,
+            'max_points': 30,
+            'required_subjects': [],
+            'preferred_subjects': []
+        }
+
+
+# ==================== ELIGIBILITY CHECK ENDPOINTS ====================
+
+@router.get("/eligibility/criteria/{programme_id}")
+@router.get("/eligibility/criteria/{programme_id}/")
+def get_eligibility_criteria(request, programme_id: int):
+    """Get eligibility criteria for a specific programme"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Programme, EligibilityCriteria
+        
+        try:
+            programme = Programme.objects.get(id=programme_id)
+        except Programme.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Programme not found"
+            }
+        
+        # Get or create criteria
+        criteria, created = EligibilityCriteria.objects.get_or_create(
+            programme=programme,
+            defaults={
+                'min_subjects': 6,
+                'min_credits': 4,
+                'max_points': 30,
+                'required_subjects': [],
+                'preferred_subjects': []
+            }
+        )
+        
+        return {
+            "success": True,
+            "data": {
+                "programme_id": criteria.programme.id,
+                "programme_name": criteria.programme.name,
+                "min_subjects": criteria.min_subjects,
+                "min_credits": criteria.min_credits,
+                "max_points": criteria.max_points,
+                "required_subjects": criteria.required_subjects,
+                "preferred_subjects": criteria.preferred_subjects,
+                "subject_weights": criteria.subject_weights or {},
+                "is_active": criteria.is_active
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error fetching eligibility criteria: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.put("/eligibility/criteria/{programme_id}")
+@router.put("/eligibility/criteria/{programme_id}/")
+def update_eligibility_criteria(request, programme_id: int, data: EligibilityCriteriaSchema):
+    """Update eligibility criteria for a programme (admin only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Programme, EligibilityCriteria
+        
+        try:
+            programme = Programme.objects.get(id=programme_id)
+        except Programme.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Programme not found"
+            }
+        
+        criteria, created = EligibilityCriteria.objects.update_or_create(
+            programme=programme,
+            defaults={
+                'min_subjects': data.min_subjects,
+                'min_credits': data.min_credits,
+                'max_points': data.max_points,
+                'required_subjects': data.required_subjects,
+                'preferred_subjects': data.preferred_subjects,
+                'subject_weights': data.subject_weights or {},
+                'updated_by': user
+            }
+        )
+        
+        # Log the change
+        from .models import AuditLog
+        AuditLog.objects.create(
+            user=user,
+            action="eligibility_criteria_updated",
+            resource_type="Programme",
+            resource_id=programme_id,
+            new_value=f"Updated eligibility criteria for {programme.name}",
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        return {
+            "success": True,
+            "message": "Eligibility criteria updated successfully",
+            "data": {
+                "programme_id": criteria.programme.id,
+                "programme_name": criteria.programme.name,
+                "min_subjects": criteria.min_subjects,
+                "min_credits": criteria.min_credits,
+                "max_points": criteria.max_points,
+                "required_subjects": criteria.required_subjects,
+                "preferred_subjects": criteria.preferred_subjects
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error updating eligibility criteria: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.get("/eligibility/check/{applicant_id}")
+@router.get("/eligibility/check/{applicant_id}/")
+@router.post("/eligibility/check/{applicant_id}")
+@router.post("/eligibility/check/{applicant_id}/")
+def check_eligibility(request, applicant_id: int):
+    """Auto-check eligibility for an applicant"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Applicant, SubjectRecord, EligibilityOverride, EligibilityLog
+        
+        try:
+            applicant = Applicant.objects.get(id=applicant_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Applicant not found"
+            }
+        
+        
+        # Get subject records
+        subject_records = SubjectRecord.objects.filter(user=applicant.user)
+        
+        # Grade to points mapping
+        grade_to_points = {
+            '1': 1, '2': 2, '3': 3, '4': 4, '5': 5,
+            '6': 6, '7': 7, '8': 8, '9': 9, 'U': 10,
+            'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'F': 6
+        }
+        
+        # Calculate metrics
+        grades = []
+        credits = 0
+        subjects_list = []
+        
+        for record in subject_records:
+            grade = str(record.grade).upper()
+            points = grade_to_points.get(grade, 5)
+            grades.append(points)
+            subjects_list.append(record.subject.lower())
+            if points <= 3:  # Credit or better
+                credits += 1
+        
+        subjects_count = len(grades)
+        total_points = sum(grades)
+        grade_point_average = total_points / subjects_count if subjects_count > 0 else 0
+        
+        # Get programme criteria
+        programme_id = applicant.selected_programme_id or 1
+        criteria = get_programme_criteria_sync(programme_id)
+        
+        # Perform eligibility checks
+        checks_passed = []
+        checks_failed = []
+        warnings = []
+        recommendations = []
+        
+        # Check 1: Minimum subjects
+        min_subjects = criteria.get('min_subjects', 6)
+        if subjects_count >= min_subjects:
+            checks_passed.append(f"Has {subjects_count} subjects (minimum {min_subjects})")
+        else:
+            checks_failed.append(f"Only {subjects_count} subjects (need {min_subjects})")
+            warnings.append(f"Add {min_subjects - subjects_count} more subjects")
+        
+        # Check 2: Minimum credits
+        min_credits = criteria.get('min_credits', 4)
+        if credits >= min_credits:
+            checks_passed.append(f"Has {credits} credits (minimum {min_credits})")
+        else:
+            checks_failed.append(f"Only {credits} credits (need {min_credits})")
+            recommendations.append(f"Aim for at least {min_credits} credits")
+        
+        # Check 3: Total points
+        max_points = criteria.get('max_points', 30)
+        if total_points <= max_points:
+            checks_passed.append(f"Total points: {total_points} (within limit of {max_points})")
+        else:
+            checks_failed.append(f"Total points: {total_points} (exceeds limit of {max_points})")
+            recommendations.append("Improve grades to reduce total points")
+        
+        # Check 4: Required subjects
+        required_subjects = [s.lower() for s in criteria.get('required_subjects', [])]
+        missing_required = [s for s in required_subjects if s not in subjects_list]
+        if not missing_required:
+            checks_passed.append("All required subjects completed")
+        else:
+            checks_failed.append(f"Missing required subjects: {', '.join(missing_required)}")
+            recommendations.append(f"Complete the following subjects: {', '.join(missing_required)}")
+        
+        # Calculate eligibility score (0-100)
+        score = 0
+        if subjects_count >= min_subjects:
+            score += 20
+        if credits >= min_credits:
+            score += 20
+        if total_points <= max_points:
+            score += 20
+        if not missing_required:
+            score += 20
+        
+        # Bonus for good GPA
+        if grade_point_average <= 3:
+            score += 20
+        elif grade_point_average <= 4:
+            score += 10
+        
+        # Check for manual override
+        override = EligibilityOverride.objects.filter(
+            applicant=applicant,
+            programme_id=programme_id
+        ).first()
+        
+        is_manually_overridden = override is not None
+        auto_eligible = len(checks_failed) == 0
+        eligible = auto_eligible or (is_manually_overridden and override.eligible)
+        
+        # Log the check
+        EligibilityLog.objects.create(
+            applicant=applicant,
+            programme_id=programme_id,
+            programme_name=criteria.get('programme_name', ''),
+            action='auto_check',
+            previous_status=not auto_eligible,
+            new_status=auto_eligible,
+            performed_by=user.email,
+            eligibility_score=score
+        )
+        
+        return {
+            "success": True,
+            "data": {
+                "eligible": eligible,
+                "auto_eligible": auto_eligible,
+                "manually_overridden": is_manually_overridden,
+                "overridden_by": override.performed_by if override else None,
+                "overridden_at": override.created_at.isoformat() if override else None,
+                "override_reason": override.reason if override else None,
+                "checks_passed": checks_passed,
+                "checks_failed": checks_failed,
+                "score": score,
+                "grade_point_average": round(grade_point_average, 2),
+                "subjects_count": subjects_count,
+                "credits_count": credits,
+                "total_points": total_points,
+                "warnings": warnings,
+                "recommendations": recommendations
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error checking eligibility: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.post("/eligibility/override/{applicant_id}")
+@router.post("/eligibility/override/{applicant_id}/")
+def override_eligibility(request, applicant_id: int, data: EligibilityOverrideSchema):
+    """Manually override eligibility decision (committee only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Applicant, EligibilityOverride, EligibilityLog, Notification
+        
+        try:
+            applicant = Applicant.objects.get(id=applicant_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Applicant not found"
+            }
+        
+        # Get previous eligibility status
+        previous_check = check_eligibility(request, applicant_id)
+        previous_eligible = previous_check.get('data', {}).get('auto_eligible', False) if previous_check.get('success') else False
+        
+        programme_id = applicant.selected_programme_id or 1
+        
+        # Create or update override
+        override, created = EligibilityOverride.objects.update_or_create(
+            applicant=applicant,
+            programme_id=programme_id,
+            defaults={
+                'eligible': data.eligible,
+                'reason': data.reason,
+                'notes': data.notes,
+                'performed_by': user.email,
+                'expires_at': None
+            }
+        )
+        
+        # Log the override
+        EligibilityLog.objects.create(
+            applicant=applicant,
+            programme_id=programme_id,
+            programme_name=applicant.selected_programme_name or 'Unknown',
+            action='manual_override',
+            previous_status=previous_eligible,
+            new_status=data.eligible,
+            reason=data.reason,
+            performed_by=user.email,
+            eligibility_score=100 if data.eligible else 0
+        )
+        
+        # Create notification for the applicant
+        status_text = "approved" if data.eligible else "not approved"
+        Notification.objects.create(
+            user=applicant.user,
+            title="Eligibility Status Updated",
+            message=f"Your eligibility for {applicant.selected_programme_name or 'your programme'} has been manually {status_text}. Reason: {data.reason[:100]}",
+            notification_type="eligibility",
+            is_read=False,
+            link="/application/status"
+        )
+        
+        return {
+            "success": True,
+            "message": f"Eligibility overridden to {data.eligible}",
+            "data": {
+                "eligible": data.eligible,
+                "reason": data.reason,
+                "performed_by": user.email,
+                "created_at": override.created_at.isoformat()
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error overriding eligibility: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.get("/eligibility/history/{applicant_id}")
+@router.get("/eligibility/history/{applicant_id}/")
+def get_eligibility_history(request, applicant_id: int):
+    """Get eligibility check history for an applicant"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import EligibilityLog
+        
+        logs = EligibilityLog.objects.filter(applicant_id=applicant_id).order_by('-performed_at')
+        
+        data = []
+        for log in logs:
+            data.append({
+                "id": log.id,
+                "action": log.action,
+                "previous_status": log.previous_status,
+                "new_status": log.new_status,
+                "reason": log.reason,
+                "performed_by": log.performed_by,
+                "performed_at": log.performed_at.isoformat(),
+                "eligibility_score": log.eligibility_score
+            })
+        
+        return {
+            "success": True,
+            "data": data,
+            "count": len(data)
+        }
+        
+    except Exception as e:
+        print(f"Error fetching eligibility history: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.get("/eligibility/batch-check")
+@router.get("/eligibility/batch-check/")
+def batch_check_eligibility(request):
+    """Check eligibility for all submitted applicants"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Applicant
+        
+        applicants = Applicant.objects.filter(status='submitted')
+        
+        results = []
+        for applicant in applicants:
+            check_result = check_eligibility(request, applicant.id)
+            results.append({
+                "applicant_id": applicant.id,
+                "applicant_name": f"{applicant.first_name} {applicant.last_name}",
+                "eligible": check_result.get('data', {}).get('eligible', False),
+                "auto_eligible": check_result.get('data', {}).get('auto_eligible', False),
+                "score": check_result.get('data', {}).get('score', 0)
+            })
+        
+        return {
+            "success": True,
+            "data": results,
+            "summary": {
+                "total": len(results),
+                "eligible": len([r for r in results if r['eligible']]),
+                "auto_eligible": len([r for r in results if r['auto_eligible']])
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error in batch check: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }         
 
 # ==================== JWT HELPER FUNCTIONS ====================
 api.add_router("/ml", ml_router)

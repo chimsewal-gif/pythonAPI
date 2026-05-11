@@ -824,3 +824,38 @@ class ApplicationWindow(models.Model):
             models.Index(fields=['academic_year']),
             models.Index(fields=['intake_period']),
         ]
+class EligibilityCriteria(models.Model):
+    programme = models.ForeignKey(Programme, on_delete=models.CASCADE, related_name='eligibility_criteria')
+    min_subjects = models.IntegerField(default=6)
+    min_credits = models.IntegerField(default=4)
+    max_points = models.IntegerField(default=30)
+    required_subjects = models.JSONField(default=list)
+    preferred_subjects = models.JSONField(default=list)
+    subject_weights = models.JSONField(default=dict, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_criteria')
+    updated_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='updated_criteria')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+class EligibilityOverride(models.Model):
+    applicant = models.ForeignKey(Applicant, on_delete=models.CASCADE, related_name='eligibility_overrides')
+    programme_id = models.IntegerField()
+    eligible = models.BooleanField()
+    reason = models.TextField()
+    notes = models.TextField(blank=True)
+    performed_by = models.CharField(max_length=255)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class EligibilityLog(models.Model):
+    applicant = models.ForeignKey(Applicant, on_delete=models.CASCADE, related_name='eligibility_logs')
+    programme_id = models.IntegerField()
+    programme_name = models.CharField(max_length=255)
+    action = models.CharField(max_length=50)  # 'auto_check', 'manual_override', 'override_removed'
+    previous_status = models.BooleanField()
+    new_status = models.BooleanField()
+    reason = models.TextField(blank=True)
+    performed_by = models.CharField(max_length=255)
+    eligibility_score = models.FloatField(default=0)
+    performed_at = models.DateTimeField(auto_now_add=True)
