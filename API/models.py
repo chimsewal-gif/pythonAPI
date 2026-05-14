@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import User
 from django.utils import timezone
+import base64
 
 # Item model - Keep only one instance
 class Item(models.Model):
@@ -30,7 +31,7 @@ class Department(models.Model):
         db_table = 'departments'
         ordering = ['name']
 
-# Applicant model - Keep only one instance with updated fields including document fields and ML fields
+# Applicant model - Database-only document storage
 class Applicant(models.Model):
     STATUS_CHOICES = [
         ('pending', 'Pending'),
@@ -47,6 +48,17 @@ class Applicant(models.Model):
         ('international', 'International Student Application'),
         ('weekend', 'Weekend Program'),
         ('masters', 'Masters Program'),
+    ]
+    
+    # ========== USER ROLE CHOICES ==========
+    ROLE_CHOICES = [
+        ('student', 'Student'),
+        ('applicant', 'Applicant'),
+        ('admin', 'Administrator'),
+        ('admission_officer', 'Admission Officer'),
+        ('committee', 'Committee Member'),
+        ('staff', 'Staff'),
+        ('guest', 'Guest'),
     ]
     
     GENDER_CHOICES = [
@@ -68,29 +80,55 @@ class Applicant(models.Model):
     email = models.EmailField(blank=True)
     phone = models.CharField(max_length=20, blank=True)
     program = models.CharField(max_length=50, choices=PROGRAM_CHOICES, blank=True, null=True)
+    
+    # ========== USER ROLE FIELD ==========
+    role = models.CharField(max_length=50, choices=ROLE_CHOICES, default='applicant', help_text="User role for access control")
+    
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     application_date = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     reference_number = models.CharField(max_length=100, blank=True, null=True, unique=True)
     
-    # Rejection reason field (used in analytics)
+    # ========== REJECTION FIELDS ==========
     rejection_reason = models.TextField(blank=True, null=True, help_text="Reason for rejection if status is rejected")
+    rejection_details = models.JSONField(blank=True, null=True, default=dict, help_text="Detailed rejection information including factors and recommendations")
+    reviewed_by = models.CharField(max_length=255, blank=True, null=True, help_text="User who reviewed the application")
+    reviewed_at = models.DateTimeField(blank=True, null=True, help_text="When the application was reviewed")
+    # ======================================
     
     # Auto-processed field (used in processing stats)
     auto_processed = models.BooleanField(default=False, help_text="Whether this application was auto-processed by ML")
     
-    # Document fields
-    msce = models.CharField(max_length=500, blank=True, null=True)
-    msce_size = models.IntegerField(blank=True, null=True)
+    # ========== DOCUMENT FIELDS - DATABASE STORAGE ONLY ==========
+    # MSCE Certificate
+    msce_content = models.BinaryField(blank=True, null=True, help_text="Binary content of MSCE certificate")
+    msce_base64 = models.TextField(blank=True, null=True, help_text="Base64 encoded MSCE certificate for API transfer")
     msce_name = models.CharField(max_length=255, blank=True, null=True)
+    msce_size = models.IntegerField(blank=True, null=True)
+    msce_type = models.CharField(max_length=100, blank=True, null=True, help_text="MIME type (e.g., application/pdf)")
     
-    id_card = models.CharField(max_length=500, blank=True, null=True)
-    id_card_size = models.IntegerField(blank=True, null=True)
+    # National ID Card
+    id_card_content = models.BinaryField(blank=True, null=True, help_text="Binary content of ID card")
+    id_card_base64 = models.TextField(blank=True, null=True, help_text="Base64 encoded ID card for API transfer")
     id_card_name = models.CharField(max_length=255, blank=True, null=True)
+    id_card_size = models.IntegerField(blank=True, null=True)
+    id_card_type = models.CharField(max_length=100, blank=True, null=True, help_text="MIME type (e.g., image/jpeg)")
     
-    payment_proof = models.CharField(max_length=500, blank=True, null=True)
-    payment_proof_size = models.IntegerField(blank=True, null=True)
+    # Payment Proof
+    payment_proof_content = models.BinaryField(blank=True, null=True, help_text="Binary content of payment proof")
+    payment_proof_base64 = models.TextField(blank=True, null=True, help_text="Base64 encoded payment proof for API transfer")
     payment_proof_name = models.CharField(max_length=255, blank=True, null=True)
+    payment_proof_size = models.IntegerField(blank=True, null=True)
+    payment_proof_type = models.CharField(max_length=100, blank=True, null=True, help_text="MIME type (e.g., application/pdf, image/jpeg)")
+    
+    # Legacy fields (kept for migration, will be removed later)
+    msce = models.CharField(max_length=500, blank=True, null=True)
+    id_card = models.CharField(max_length=500, blank=True, null=True)
+    payment_proof = models.CharField(max_length=500, blank=True, null=True)
+    
+    # ========== DOCUMENT VALIDATION FIELD ==========
+    documents_valid = models.BooleanField(default=False, null=True, blank=True, help_text="Whether the applicant's documents have been verified")
+    # ===============================================
     
     # Programme selection fields
     selected_programme = models.ForeignKey(
@@ -157,6 +195,30 @@ class Applicant(models.Model):
         if self.selection_date and timezone.is_naive(self.selection_date):
             self.selection_date = timezone.make_aware(self.selection_date, timezone.get_current_timezone())
         super().save(*args, **kwargs)
+    
+    def get_msce_base64_data(self):
+        """Get base64 encoded MSCE certificate for API response"""
+        if self.msce_base64:
+            return self.msce_base64
+        if self.msce_content:
+            return base64.b64encode(self.msce_content).decode('utf-8')
+        return None
+    
+    def get_id_card_base64_data(self):
+        """Get base64 encoded ID card for API response"""
+        if self.id_card_base64:
+            return self.id_card_base64
+        if self.id_card_content:
+            return base64.b64encode(self.id_card_content).decode('utf-8')
+        return None
+    
+    def get_payment_proof_base64_data(self):
+        """Get base64 encoded payment proof for API response"""
+        if self.payment_proof_base64:
+            return self.payment_proof_base64
+        if self.payment_proof_content:
+            return base64.b64encode(self.payment_proof_content).decode('utf-8')
+        return None
     
     def __str__(self):
         return f"{self.first_name} {self.last_name}"
@@ -313,7 +375,7 @@ class FeeStatus(models.Model):
         verbose_name = "Fee Status"
         verbose_name_plural = "Fee Statuses"
 
-# FeePayment model for tracking deposit slips (OneToOne with User)
+# FeePayment model - Database-only storage for deposit slips
 class FeePayment(models.Model):
     STATUS_CHOICES = [
         ('pending', 'Pending'),
@@ -323,12 +385,30 @@ class FeePayment(models.Model):
     ]
     
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='fee_payment')
-    deposit_slip_path = models.CharField(max_length=500)
+    
+    # Database storage for deposit slip
+    deposit_slip_content = models.BinaryField(blank=True, null=True, help_text="Binary content of deposit slip")
+    deposit_slip_base64 = models.TextField(blank=True, null=True, help_text="Base64 encoded deposit slip for API transfer")
+    deposit_slip_name = models.CharField(max_length=255, blank=True, null=True)
+    deposit_slip_size = models.IntegerField(blank=True, null=True)
+    deposit_slip_type = models.CharField(max_length=100, blank=True, null=True, help_text="MIME type (e.g., image/jpeg, application/pdf)")
+    
+    # Legacy field (kept for migration)
+    deposit_slip_path = models.CharField(max_length=500, blank=True, null=True)
+    
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     uploaded_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     amount = models.DecimalField(max_digits=10, decimal_places=2, default=25000)
     notes = models.TextField(blank=True, null=True)
+    
+    def get_deposit_slip_base64_data(self):
+        """Get base64 encoded deposit slip for API response"""
+        if self.deposit_slip_base64:
+            return self.deposit_slip_base64
+        if self.deposit_slip_content:
+            return base64.b64encode(self.deposit_slip_content).decode('utf-8')
+        return None
     
     def __str__(self):
         return f"{self.user.username} - {self.status} - {self.amount} MWK"
@@ -365,6 +445,7 @@ class SubjectRecord(models.Model):
         db_table = 'subject_records'
         ordering = ['-year', 'subject']
 
+# CommitteeMember model - Database-only storage for profile images
 class CommitteeMember(models.Model):
     name = models.CharField(max_length=200)
     role = models.CharField(max_length=100)
@@ -372,11 +453,28 @@ class CommitteeMember(models.Model):
     phone = models.CharField(max_length=20, blank=True, null=True)
     department = models.CharField(max_length=200, blank=True, null=True)
     bio = models.TextField(blank=True, null=True)
+    
+    # Database storage for profile image
+    profile_image_content = models.BinaryField(blank=True, null=True, help_text="Binary content of profile image")
+    profile_image_base64 = models.TextField(blank=True, null=True, help_text="Base64 encoded profile image for API transfer")
+    profile_image_name = models.CharField(max_length=255, blank=True, null=True)
+    profile_image_type = models.CharField(max_length=100, blank=True, null=True, help_text="MIME type (e.g., image/jpeg, image/png)")
+    
+    # Legacy field (kept for migration)
     profile_image = models.ImageField(upload_to='committee/', blank=True, null=True)
+    
     order = models.IntegerField(default=0)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    
+    def get_profile_image_base64_data(self):
+        """Get base64 encoded profile image for API response"""
+        if self.profile_image_base64:
+            return self.profile_image_base64
+        if self.profile_image_content:
+            return base64.b64encode(self.profile_image_content).decode('utf-8')
+        return None
     
     def __str__(self):
         return f"{self.name} - {self.role}"
@@ -429,15 +527,32 @@ class ProgrammeChoice(models.Model):
     def __str__(self):
         return f"{self.user.username} - Choice {self.choice_number}: {self.programme_name}"
 
+# Document model - Database-only storage
 class Document(models.Model):
     applicant = models.ForeignKey(Applicant, on_delete=models.CASCADE)
     document_name = models.CharField(max_length=255)
     document_type = models.CharField(max_length=100)
-    file = models.FileField(upload_to='documents/')
+    
+    # Database storage for document
+    file_content = models.BinaryField(blank=True, null=True, help_text="Binary content of document")
+    file_base64 = models.TextField(blank=True, null=True, help_text="Base64 encoded document for API transfer")
+    file_size = models.IntegerField(blank=True, null=True)
+    file_mime_type = models.CharField(max_length=100, blank=True, null=True, help_text="MIME type")
+    
     uploaded_at = models.DateTimeField(auto_now_add=True)
-    # Add missing fields that might be used
     title = models.CharField(max_length=255, blank=True, null=True)
     description = models.TextField(blank=True, null=True)
+    
+    # Legacy field (kept for migration)
+    file = models.FileField(upload_to='documents/', blank=True, null=True)
+    
+    def get_file_base64_data(self):
+        """Get base64 encoded document for API response"""
+        if self.file_base64:
+            return self.file_base64
+        if self.file_content:
+            return base64.b64encode(self.file_content).decode('utf-8')
+        return None
     
     def __str__(self):
         return self.document_name
@@ -824,6 +939,7 @@ class ApplicationWindow(models.Model):
             models.Index(fields=['academic_year']),
             models.Index(fields=['intake_period']),
         ]
+
 class EligibilityCriteria(models.Model):
     programme = models.ForeignKey(Programme, on_delete=models.CASCADE, related_name='eligibility_criteria')
     min_subjects = models.IntegerField(default=6)

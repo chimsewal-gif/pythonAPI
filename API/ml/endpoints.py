@@ -64,6 +64,8 @@ class RecommendationRequestSchema(Schema):
     subjects: List[SubjectGradeSchema]
     top_n: int = 6
     programme_type: str = "all"
+    application_category: str = "all"  # NEW: degree, masters, phd, diploma, certificate, or all
+
 
 class ProgrammeRecommendationSchema(Schema):
     id: int
@@ -212,11 +214,13 @@ def batch_predict_admission(request, data: List[PredictionInputSchema]):
 def recommend_programmes(request, data: RecommendationRequestSchema):
     """
     Get programme recommendations based on student's MSCE results
+    Filters by application_category: degree, masters, phd, diploma, certificate, or all
     """
     try:
         user = get_user_from_request(request)
         if user:
             logger.info(f"Programme recommendation request from user {user.id}")
+            logger.info(f"Application category filter: {data.application_category}")
         
         subjects = [{'subject': s.subject, 'grade': s.grade} for s in data.subjects]
         
@@ -228,10 +232,13 @@ def recommend_programmes(request, data: RecommendationRequestSchema):
             }
         
         recommender = get_recommender()
+        
+        # Get recommendations with application category filter
         recommendations = recommender.recommend_programmes(
             subjects=subjects,
             top_n=data.top_n,
-            programme_type=data.programme_type
+            programme_type=data.programme_type,
+            application_category=data.application_category  # Pass the filter to recommender
         )
         
         # Ensure all recommendations have proper types
@@ -251,7 +258,8 @@ def recommend_programmes(request, data: RecommendationRequestSchema):
                 "min_points": int(rec.get("min_points", 30)),
                 "required_credits": int(rec.get("required_credits", 4)),
                 "quota": int(rec.get("quota", 0)) if rec.get("quota") and str(rec.get("quota")) != "nan" else 0,
-                "rank": int(rec.get("rank", 0)) if rec.get("rank") else None
+                "rank": int(rec.get("rank", 0)) if rec.get("rank") else None,
+                "application_category": rec.get("application_category", "degree")
             }
             clean_recommendations.append(clean_rec)
         
@@ -265,7 +273,7 @@ def recommend_programmes(request, data: RecommendationRequestSchema):
         
         return 200, {
             "success": True,
-            "message": f"Found {len(clean_recommendations)} programme recommendations",
+            "message": f"Found {len(clean_recommendations)} programme recommendations for {data.application_category}",
             "student_stats": {
                 "subjects_count": len(subjects),
                 "average_points": round(avg_points, 2),
@@ -346,6 +354,7 @@ def get_eligible_programmes(request):
                 "code": prog.get('code', ''),
                 "duration": prog['duration'],
                 "type": prog.get('type', 'generic'),
+                "application_category": prog.get('application_category', 'degree'),
                 "required_subjects": prog.get('subjects', []),
                 "min_points": prog.get('min_points', 30),
                 "required_credits": prog.get('required_credits', 4),
@@ -967,9 +976,9 @@ def predict_submission(request, submission_id: int):
             "recommendation": "Unable to generate prediction due to an error.",
             "priority_level": "Medium"
         }
-# ============ Committee Predictions Dashboard Endpoints ============
-# These endpoints are used by the Committee Predictions frontend page
 
+
+# ============ Committee Predictions Dashboard Endpoints ============
 @csrf_exempt
 @ml_router.get("/predictions/dashboard", response={200: dict, 400: dict})
 @ml_router.get("/predictions/dashboard/", response={200: dict, 400: dict})
@@ -1254,8 +1263,33 @@ def batch_predict_admissions_endpoint(request, data: dict = None):
         }
 
 
+# Add a new endpoint to get programme categories
+@csrf_exempt
+@ml_router.get("/programme-categories", response={200: dict, 400: dict})
+@ml_router.get("/programme-categories/", response={200: dict, 400: dict})
+def get_programme_categories(request):
+    """
+    Get available programme categories with counts
+    """
+    try:
+        recommender = get_recommender()
+        categories = recommender.get_available_categories()
+        category_counts = recommender.get_category_statistics()
+        
+        return 200, {
+            "success": True,
+            "categories": categories,
+            "counts": category_counts.get('categories', {}),
+            "total": category_counts.get('total_programmes', 0)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching programme categories: {str(e)}", exc_info=True)
+        return 400, {
+            "success": False,
+            "error": str(e)
+        }
 
 
-
-# Add this at the very end of API/ml/endpoints.py
+# Add this at the very end
 router = ml_router  # Create alias for backward compatibility

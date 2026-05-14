@@ -8,6 +8,7 @@ from django.conf import settings
 import jwt
 from typing import Optional, List
 import os
+import base64
 import json
 from django.core.mail import send_mail
 from django.template.loader import render_to_string
@@ -245,7 +246,6 @@ def get_user_from_token(request):
         raise HttpError(401, "User not found")
 
 # ==================== AUTH ENDPOINTS ====================
-
 @router.post("/login", response={200: AuthResponseSchema, 401: dict})
 @router.post("/login/", response={200: AuthResponseSchema, 401: dict})
 def login_user(request, data: LoginSchema):
@@ -266,11 +266,30 @@ def login_user(request, data: LoginSchema):
         if user.check_password(data.password):
             token = create_jwt_token(user)
             
+            # Get role from Applicant model, with proper fallbacks
             try:
                 applicant = Applicant.objects.get(user=user)
-                role = applicant.program or 'guest'
+                # Use the stored role field first
+                role = applicant.role if applicant.role else 'applicant'
+                
+                # If role is still 'applicant' but the user is a superuser/staff, override
+                if user.is_superuser:
+                    role = 'admin'
+                elif user.is_staff and role == 'applicant':
+                    role = 'staff'
+                    
             except Applicant.DoesNotExist:
-                role = 'guest'
+                # Create applicant profile if it doesn't exist
+                applicant = Applicant.objects.create(
+                    user=user,
+                    first_name=user.first_name,
+                    last_name=user.last_name,
+                    email=user.email,
+                    role='admin' if user.is_superuser else ('staff' if user.is_staff else 'applicant')
+                )
+                role = applicant.role
+            
+            print(f"✅ User role: {role}")
             
             return {
                 "success": True,
@@ -292,9 +311,346 @@ def login_user(request, data: LoginSchema):
         raise
     except Exception as e:
         print(f"Login error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HttpError(500, f"Login failed: {str(e)}")
 
+
+# Add this new schema class with your other schemas (around line 100-150 area)
+class GoogleLoginSchema(Schema):
+    credential: str
+    client_id: str
+
+
+def get_role_from_email(email: str) -> str:
+    """Determine role based on email pattern"""
+    email_lower = email.lower()
+    if 'admin' in email_lower:
+        return 'admin'
+    elif 'admission' in email_lower or 'officer' in email_lower:
+        return 'admission_officer'
+    elif 'committee' in email_lower:
+        return 'committee'
+    elif 'staff' in email_lower:
+        return 'staff'
+    else:
+        return 'applicant'
+
+
+def determine_user_role(user, applicant=None) -> str:
+    """Determine user role based on multiple factors"""
+    # Superuser always gets admin role
+    if user.is_superuser:
+        return 'admin'
+    
+    # If applicant exists and has a role set, use it
+    if applicant and applicant.role:
+        return applicant.role
+    
+    # Check staff status
+    if user.is_staff:
+        return 'staff'
+    
+    # Check email patterns
+    if user.email:
+        role_from_email = get_role_from_email(user.email)
+        if role_from_email != 'applicant':
+            return role_from_email
+    
+    # Default role for regular users
+    return 'applicant'
+
+
+# Add this function to verify Google token and get/create user
+def verify_google_token(credential: str, client_id: str):
+    """Verify Google ID token and return user info"""
+    try:
+        from google.oauth2 import id_token
+        from google.auth.transport import requests
         
+        # Verify the token
+        id_info = id_token.verify_oauth2_token(
+            credential,
+            requests.Request(),
+            client_id
+        )
+        
+        # Check if token is valid
+        if id_info['iss'] not in ['accounts.google.com', 'https://accounts.google.com']:
+            raise ValueError('Wrong issuer.')
+        
+        return {
+            'email': id_info.get('email'),
+            'first_name': id_info.get('given_name', ''),
+            'last_name': id_info.get('family_name', ''),
+            'email_verified': id_info.get('email_verified', False),
+            'picture': id_info.get('picture', ''),
+            'sub': id_info.get('sub')  # Google user ID
+        }
+    except Exception as e:
+        print(f"Google token verification error: {str(e)}")
+        return None
+
+
+@router.post("/google-login", response={200: AuthResponseSchema, 400: dict, 401: dict})
+@router.post("/google-login/", response={200: AuthResponseSchema, 400: dict, 401: dict})
+def google_login(request, data: GoogleLoginSchema):
+    """Login or register user with Google OAuth"""
+    try:
+        print(f"📝 Google login attempt")
+        
+        # Verify the Google token
+        user_info = verify_google_token(data.credential, data.client_id)
+        
+        if not user_info:
+            raise HttpError(401, "Invalid Google token")
+        
+        email = user_info['email']
+        first_name = user_info['first_name']
+        last_name = user_info['last_name']
+        
+        print(f"✅ Google user verified: {email}")
+        
+        # Check if user exists
+        try:
+            user = User.objects.get(email=email)
+            print(f"📚 Existing user found: {user.username}")
+            
+            # Update user's name if needed
+            if not user.first_name and first_name:
+                user.first_name = first_name
+            if not user.last_name and last_name:
+                user.last_name = last_name
+            user.save()
+            
+        except User.DoesNotExist:
+            # Create new user
+            username = email.split('@')[0]
+            # Make username unique if needed
+            base_username = username
+            counter = 1
+            while User.objects.filter(username=username).exists():
+                username = f"{base_username}{counter}"
+                counter += 1
+            
+            # Create user with a random password (they'll use Google login)
+            import secrets
+            random_password = secrets.token_urlsafe(32)
+            
+            user = User.objects.create_user(
+                username=username,
+                email=email,
+                password=random_password,
+                first_name=first_name,
+                last_name=last_name
+            )
+            print(f"✅ New user created: {user.username}")
+        
+        # Get or create applicant profile and set role
+        try:
+            applicant = Applicant.objects.get(user=user)
+            # Determine role
+            role = determine_user_role(user, applicant)
+            if applicant.role != role:
+                applicant.role = role
+                applicant.save()
+                print(f"✅ Updated applicant role to: {role}")
+        except Applicant.DoesNotExist:
+            role = determine_user_role(user, None)
+            applicant = Applicant.objects.create(
+                user=user,
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+                role=role,
+                status='pending'
+            )
+            print(f"✅ Applicant profile created for {user.username} with role: {role}")
+        
+        # Generate JWT token
+        token = create_jwt_token(user)
+        
+        # Create notification for new Google login
+        try:
+            from .models import Notification
+            welcome_message = f"Welcome {user.first_name or user.username}! You've successfully logged in with Google."
+            if role == 'admin':
+                welcome_message += " You have administrator privileges."
+            elif role == 'committee':
+                welcome_message += " You have committee member privileges."
+            elif role == 'admission_officer':
+                welcome_message += " You have admission officer privileges."
+            
+            Notification.objects.create(
+                user=user,
+                title="Welcome!",
+                message=welcome_message,
+                notification_type="auth",
+                is_read=False,
+                link="/dashboard"
+            )
+        except Exception as notif_error:
+            print(f"⚠️ Could not create notification: {notif_error}")
+        
+        return {
+            "success": True,
+            "message": "Google login successful",
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "username": user.username,
+                "role": role
+            },
+            "token": token
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Google login error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Google login failed: {str(e)}"
+        }
+
+
+# Add endpoint to update user role (for admin)
+class UpdateUserRoleSchema(Schema):
+    role: str
+
+@router.put("/users/{user_id}/role", response={200: dict, 400: dict, 401: dict, 404: dict})
+@router.put("/users/{user_id}/role/", response={200: dict, 400: dict, 401: dict, 404: dict})
+def update_user_role(request, user_id: int, data: UpdateUserRoleSchema):
+    """Update a user's role (admin only)"""
+    try:
+        admin_user = get_user_from_token(request)
+        
+        # Check if the requesting user is admin
+        try:
+            admin_applicant = Applicant.objects.get(user=admin_user)
+            if admin_applicant.role not in ['admin', 'administrator']:
+                return {
+                    "success": False,
+                    "message": "Only administrators can update user roles"
+                }
+        except Applicant.DoesNotExist:
+            if not admin_user.is_superuser:
+                return {
+                    "success": False,
+                    "message": "Only administrators can update user roles"
+                }
+        
+        try:
+            target_user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"User with ID {user_id} not found"
+            }
+        
+        valid_roles = ['applicant', 'student', 'staff', 'admission_officer', 'committee', 'admin']
+        if data.role not in valid_roles:
+            return {
+                "success": False,
+                "message": f"Invalid role. Must be one of: {', '.join(valid_roles)}"
+            }
+        
+        try:
+            applicant, created = Applicant.objects.get_or_create(user=target_user)
+            applicant.role = data.role
+            applicant.save()
+            
+            # If setting to admin, also make them staff/superuser
+            if data.role == 'admin' and not target_user.is_superuser:
+                target_user.is_superuser = True
+                target_user.is_staff = True
+                target_user.save()
+            elif data.role == 'staff' and not target_user.is_staff:
+                target_user.is_staff = True
+                target_user.save()
+            
+        except Exception as e:
+            print(f"Error updating applicant: {str(e)}")
+            return {
+                "success": False,
+                "message": f"Failed to update role: {str(e)}"
+            }
+        
+        # Log the role change
+        from .models import AuditLog
+        AuditLog.objects.create(
+            user=admin_user,
+            action="role_update",
+            resource_type="User",
+            resource_id=target_user.id,
+            new_value=f"Role updated to {data.role}",
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        return {
+            "success": True,
+            "message": f"User role updated to {data.role}",
+            "data": {
+                "user_id": target_user.id,
+                "email": target_user.email,
+                "role": data.role
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error updating user role: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+# Add endpoint to get current user's role (for frontend)
+@router.get("/user/role", response={200: dict, 401: dict})
+@router.get("/user/role/", response={200: dict, 401: dict})
+def get_current_user_role(request):
+    """Get current user's role"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            applicant = Applicant.objects.get(user=user)
+            role = applicant.role or 'applicant'
+        except Applicant.DoesNotExist:
+            # Determine role for user without applicant profile
+            if user.is_superuser:
+                role = 'admin'
+            elif user.is_staff:
+                role = 'staff'
+            else:
+                role = 'applicant'
+        
+        return {
+            "success": True,
+            "role": role,
+            "user_id": user.id,
+            "email": user.email
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error getting user role: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+
+
 @router.post("/register", response={201: AuthResponseSchema, 200: AuthResponseSchema, 400: dict})
 @router.post("/register/", response={201: AuthResponseSchema, 200: AuthResponseSchema, 400: dict})
 def register_applicant(request, data: ApplicantRegistrationSchema):
@@ -312,6 +668,9 @@ def register_applicant(request, data: ApplicantRegistrationSchema):
             last_name=data.lastname
         )
         
+        # Determine role from registration data or email
+        role = data.role if data.role != 'guest' else 'applicant'
+        
         applicant = Applicant.objects.create(
             user=user,
             first_name=data.firstname,
@@ -321,6 +680,7 @@ def register_applicant(request, data: ApplicantRegistrationSchema):
             phone=data.phone or "",
             date_of_birth=data.dob if data.dob else None,
             program=data.role if data.role != 'guest' else None,
+            role=role,  # Set the role field
             status='pending'
         )
         
@@ -335,7 +695,7 @@ def register_applicant(request, data: ApplicantRegistrationSchema):
                 "first_name": user.first_name,
                 "last_name": user.last_name,
                 "username": user.username,
-                "role": data.role
+                "role": role
             },
             "token": token
         }
@@ -345,6 +705,7 @@ def register_applicant(request, data: ApplicantRegistrationSchema):
     except Exception as e:
         print(f"Registration error: {str(e)}")
         return {"success": False, "message": f"Registration failed: {str(e)}"}
+
 
 
 
@@ -1891,6 +2252,8 @@ def get_programme_choices(request):
         }
 
 # ==================== APPLICANT SUBMISSIONS ENDPOINTS ====================@router.get("/applicant-submissions", response={200: dict})
+
+@router.get("/applicant-submissions", response={200: dict})
 @router.get("/applicant-submissions/", response={200: dict})
 def get_applicant_submissions(request):
     """Get all applicant submissions for admin with ML data from database"""
@@ -1899,17 +2262,16 @@ def get_applicant_submissions(request):
         
         print(f"📋 Fetching applicant submissions for user {user.username}")
         
-        # ✅ Only include applicants who have actually submitted their application
         valid_statuses = [
             'submitted', 'pending', 'under_review', 'reviewed',
             'accepted', 'approved', 'rejected', 'withdrawn'
         ]
         applicants = Applicant.objects.filter(
             status__in=valid_statuses,
-            application_date__isnull=False,          # Must have a submission date
-            reference_number__isnull=False           # Must have a reference number
+            application_date__isnull=False,
+            reference_number__isnull=False
         ).exclude(
-            reference_number=''                       # Exclude empty strings
+            reference_number=''
         ).order_by('-application_date')
         
         submissions = []
@@ -1922,7 +2284,7 @@ def get_applicant_submissions(request):
             if not programme_name:
                 programme_name = applicant.program or "Not specified"
             
-            reference_number = applicant.reference_number  # Already guaranteed not null
+            reference_number = applicant.reference_number
             
             # Build ML prediction data from database
             ml_prediction = None
@@ -1943,7 +2305,7 @@ def get_applicant_submissions(request):
                 "programme": programme_name,
                 "reference_number": reference_number,
                 "status": applicant.status,
-                "submitted_at": applicant.application_date.isoformat(),  # Now guaranteed non‑null
+                "submitted_at": applicant.application_date.isoformat(),
                 "email": applicant.email or user_obj.email,
                 "phone": applicant.phone or "",
                 "ml_prediction": ml_prediction,
@@ -1951,7 +2313,13 @@ def get_applicant_submissions(request):
                 "last_analyzed_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None,
                 "priority_level": applicant.ml_priority,
                 "eligibility_verified": applicant.status in ['approved', 'under_review', 'reviewed'],
-                "documents_valid": bool(applicant.msce and applicant.id_card and applicant.payment_proof)
+                # FIXED: Read the stored documents_valid field from database
+                "documents_valid": applicant.documents_valid if applicant.documents_valid is not None else False,
+                # Add rejection data
+                "rejection_reason": applicant.rejection_reason,
+                "rejection_details": applicant.rejection_details,
+                "reviewed_by": applicant.reviewed_by,
+                "reviewed_at": applicant.reviewed_at.isoformat() if applicant.reviewed_at else None
             })
         
         return {
@@ -1973,7 +2341,7 @@ def get_applicant_submissions(request):
             "data": [],
             "count": 0
         }
-    
+
 @router.get("/applicant-submissions/{submission_id}", response={200: dict})
 @router.get("/applicant-submissions/{submission_id}/", response={200: dict})
 def get_applicant_submission(request, submission_id: int):
@@ -2060,7 +2428,13 @@ def get_applicant_submission(request, submission_id: int):
             "subject_records": subject_records,
             "ml_prediction": ml_prediction,
             "last_analyzed_at": applicant.ml_processed_at.isoformat() if applicant.ml_processed_at else None,
-            "priority_level": applicant.ml_priority
+            "priority_level": applicant.ml_priority,
+            # FIXED: Read the stored documents_valid field from database
+            "documents_valid": applicant.documents_valid if applicant.documents_valid is not None else False,
+            "rejection_reason": applicant.rejection_reason,
+            "rejection_details": applicant.rejection_details,
+            "reviewed_by": applicant.reviewed_by,
+            "reviewed_at": applicant.reviewed_at.isoformat() if applicant.reviewed_at else None
         }
         
         return {
@@ -2077,6 +2451,130 @@ def get_applicant_submission(request, submission_id: int):
             "success": False,
             "message": str(e)
         }
+
+
+
+
+# Add this endpoint to your api.py (after the existing applicant-submissions endpoints)
+
+@router.get("/applicant-submissions/{submission_id}/documents")
+@router.get("/applicant-submissions/{submission_id}/documents/")
+def get_submission_documents(request, submission_id: int):
+    """Get documents for a specific submission"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            applicant = Applicant.objects.get(id=submission_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Submission not found"
+            }
+        
+        # Check if user has permission (admin or the applicant themselves)
+        if applicant.user != user:
+            # Check if user is admin/committee
+            try:
+                admin_check = Applicant.objects.get(user=user)
+                if admin_check.role not in ['admin', 'committee', 'staff']:
+                    return {
+                        "success": False,
+                        "message": "You don't have permission to view these documents"
+                    }
+            except Applicant.DoesNotExist:
+                return {
+                    "success": False,
+                    "message": "You don't have permission to view these documents"
+                }
+        
+        # Return documents
+        result = {
+            "msce": applicant.msce,
+            "msce_size": applicant.msce_size,
+            "msce_name": applicant.msce_name,
+            "id_card": applicant.id_card,
+            "id_card_size": applicant.id_card_size,
+            "id_card_name": applicant.id_card_name,
+            "payment_proof": applicant.payment_proof,
+            "payment_proof_size": applicant.payment_proof_size,
+            "payment_proof_name": applicant.payment_proof_name
+        }
+        
+        return {
+            "success": True,
+            "message": "Documents retrieved successfully",
+            "data": result
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error getting documents: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Failed to get documents: {str(e)}"
+        }
+
+
+@router.patch("/applicant-submissions/{submission_id}/documents")
+@router.patch("/applicant-submissions/{submission_id}/documents/")
+def update_submission_documents(request, submission_id: int):
+    """Update document validation status for a submission"""
+    try:
+        user = get_user_from_token(request)
+        
+        body = json.loads(request.body) if request.body else {}
+        documents_valid = body.get('documents_valid')
+        
+        if documents_valid is None:
+            return {
+                "success": False,
+                "message": "documents_valid field is required"
+            }
+        
+        try:
+            applicant = Applicant.objects.get(id=submission_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Submission not found"
+            }
+        
+        # Check if user has permission
+        try:
+            admin_check = Applicant.objects.get(user=user)
+            if admin_check.role not in ['admin', 'committee', 'staff']:
+                return {
+                    "success": False,
+                    "message": "You don't have permission to update documents"
+                }
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "You don't have permission to update documents"
+            }
+        
+        # Update documents_valid status (you may need to add this field to your Applicant model)
+        applicant.documents_valid = documents_valid
+        applicant.save()
+        
+        return {
+            "success": True,
+            "message": f"Document validation status updated to {documents_valid}",
+            "data": {
+                "documents_valid": documents_valid
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error updating documents: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+        
+
 
 # ==================== TEACHING SUBJECTS SCHEMAS ====================
 class TeachingSubjectSchema(Schema):
@@ -2209,17 +2707,23 @@ def delete_teaching_subject(request, subject_id: int):
             "message": f"Failed to delete teaching subject: {str(e)}"
         }    
 
-
-
 @router.patch("/applicant-submissions/{submission_id}/status")
 @router.patch("/applicant-submissions/{submission_id}/status/")
 def update_submission_status(request, submission_id: int):
-    """Update the status of an applicant submission"""
+    """Update the status of an applicant submission, including rejection reasons"""
     try:
         user = get_user_from_token(request)
         
-        body = json.loads(request.body)
+        import json
+        body = json.loads(request.body) if request.body else {}
         new_status = body.get('status')
+        rejection_reason = body.get('rejection_reason')
+        rejection_details = body.get('rejection_details')
+        
+        print(f"📝 Updating status for submission {submission_id}")
+        print(f"   New status: {new_status}")
+        print(f"   Rejection reason: {rejection_reason}")
+        print(f"   Rejection details: {rejection_details}")
         
         if not new_status:
             return {
@@ -2242,27 +2746,102 @@ def update_submission_status(request, submission_id: int):
                 "message": "Submission not found"
             }
         
+        # Update the status
         applicant.status = new_status
+        
+        # Handle rejection data
+        if new_status == 'rejected':
+            if rejection_reason:
+                applicant.rejection_reason = rejection_reason
+            if rejection_details:
+                # Store as JSON if it's a dict
+                if isinstance(rejection_details, dict):
+                    applicant.rejection_details = rejection_details
+                elif isinstance(rejection_details, str):
+                    applicant.rejection_details = {"reason": rejection_details}
+            # Add review information
+            applicant.reviewed_by = f"{user.first_name} {user.last_name}".strip() or user.email
+            applicant.reviewed_at = datetime.now()
+            
+            print(f"✅ Saved rejection data:")
+            print(f"   rejection_reason: {applicant.rejection_reason}")
+            print(f"   rejection_details: {applicant.rejection_details}")
+            print(f"   reviewed_by: {applicant.reviewed_by}")
+            print(f"   reviewed_at: {applicant.reviewed_at}")
+        else:
+            # Clear rejection data when not rejected
+            applicant.rejection_reason = None
+            applicant.rejection_details = None
+        
         applicant.save()
+        
+        # Create notification for the applicant
+        try:
+            from .models import Notification
+            if new_status == 'rejected':
+                notification_title = "Application Status Update - Not Successful"
+                notification_message = f"Dear applicant, your application has been reviewed and was not successful. Reason: {rejection_reason[:200] if rejection_reason else 'Please contact admissions for more information.'}"
+                Notification.objects.create(
+                    user=applicant.user,
+                    title=notification_title,
+                    message=notification_message,
+                    notification_type="application",
+                    is_read=False,
+                    link=f"/committee/applicant-submissions/{submission_id}"
+                )
+                print(f"✅ Created rejection notification for {applicant.user.email}")
+            elif new_status in ['approved', 'accepted']:
+                notification_title = "Application Status Update - Successful!"
+                notification_message = f"Congratulations! Your application has been {new_status}. You will receive further instructions via email."
+                Notification.objects.create(
+                    user=applicant.user,
+                    title=notification_title,
+                    message=notification_message,
+                    notification_type="application",
+                    is_read=False,
+                    link=f"/committee/applicant-submissions/{submission_id}"
+                )
+                print(f"✅ Created approval notification for {applicant.user.email}")
+        except Exception as notif_error:
+            print(f"⚠️ Could not create notification: {notif_error}")
+        
+        # Log the action
+        try:
+            from .models import AuditLog
+            AuditLog.objects.create(
+                user=user,
+                action="status_update",
+                resource_type="Applicant",
+                resource_id=applicant.id,
+                new_value=f"Status updated to {new_status}" + (f" - Rejection: {rejection_reason[:100]}" if rejection_reason else ""),
+                ip_address=request.META.get('REMOTE_ADDR'),
+                user_agent=request.META.get('HTTP_USER_AGENT', '')
+            )
+        except Exception as log_error:
+            print(f"⚠️ Could not create audit log: {log_error}")
         
         return {
             "success": True,
             "message": f"Status updated to {new_status}",
             "data": {
                 "id": applicant.id,
-                "status": applicant.status
+                "status": applicant.status,
+                "rejection_reason": applicant.rejection_reason,
+                "rejection_details": applicant.rejection_details,
+                "reviewed_by": applicant.reviewed_by,
+                "reviewed_at": applicant.reviewed_at.isoformat() if applicant.reviewed_at else None
             }
         }
         
     except Exception as e:
-        print(f"Error updating status: {str(e)}")
+        print(f"❌ Error updating status: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return {
             "success": False,
             "message": str(e)
         }
-
-
-
+    
 @router.patch("/applicant-submissions/{submission_id}/ml-prediction")
 @router.patch("/applicant-submissions/{submission_id}/ml-prediction/")
 def update_ml_prediction(request, submission_id: int):
@@ -2409,119 +2988,12 @@ def get_applicants(request):
 
 # ==================== DOCUMENT UPLOAD ENDPOINTS ====================
 # In your API views.py or api.py - Make sure this endpoint properly saves files
+# In your api.py, replace the existing upload_documents endpoint with this:
 
 @router.post("/applicants/{applicant_id}/documents")
 @router.post("/applicants/{applicant_id}/documents/")
 def upload_documents(request, applicant_id: int):
-    """Upload documents for an applicant and store references in database"""
-    try:
-        user = get_user_from_token(request)
-        
-        try:
-            applicant = Applicant.objects.get(id=applicant_id, user=user)
-        except Applicant.DoesNotExist:
-            return {"success": False, "message": "Applicant not found"}, 404
-        
-        docs_dir = os.path.join(settings.MEDIA_ROOT, 'documents', str(applicant_id))
-        os.makedirs(docs_dir, exist_ok=True)
-        
-        result = {}
-        
-        # Handle MSCE certificate upload
-        if 'msce' in request.FILES:
-            msce_file = request.FILES['msce']
-            if msce_file.size > 5 * 1024 * 1024:
-                return {"success": False, "message": "File size must be less than 5MB"}, 400
-            
-            # Delete old file if exists
-            if applicant.msce:
-                old_path = os.path.join(settings.MEDIA_ROOT, applicant.msce)
-                if os.path.exists(old_path):
-                    os.remove(old_path)
-            
-            ext = msce_file.name.split('.')[-1]
-            filename = f"msce_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
-            filepath = os.path.join('documents', str(applicant_id), filename)
-            saved_path = default_storage.save(filepath, ContentFile(msce_file.read()))
-            
-            # Save to database immediately
-            applicant.msce = saved_path
-            applicant.msce_size = msce_file.size
-            applicant.msce_name = msce_file.name
-            applicant.save()  # IMPORTANT: Save to database
-            
-            result['msce'] = saved_path
-            result['msce_size'] = msce_file.size
-            result['msce_name'] = msce_file.name
-        
-        # Handle ID Card upload
-        if 'id_card' in request.FILES:
-            id_file = request.FILES['id_card']
-            if id_file.size > 5 * 1024 * 1024:
-                return {"success": False, "message": "File size must be less than 5MB"}, 400
-            
-            if applicant.id_card:
-                old_path = os.path.join(settings.MEDIA_ROOT, applicant.id_card)
-                if os.path.exists(old_path):
-                    os.remove(old_path)
-            
-            ext = id_file.name.split('.')[-1]
-            filename = f"id_card_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
-            filepath = os.path.join('documents', str(applicant_id), filename)
-            saved_path = default_storage.save(filepath, ContentFile(id_file.read()))
-            
-            applicant.id_card = saved_path
-            applicant.id_card_size = id_file.size
-            applicant.id_card_name = id_file.name
-            applicant.save()  # IMPORTANT: Save to database
-            
-            result['id_card'] = saved_path
-            result['id_card_size'] = id_file.size
-            result['id_card_name'] = id_file.name
-        
-        # Handle Payment Proof upload
-        if 'payment_proof' in request.FILES:
-            payment_file = request.FILES['payment_proof']
-            if payment_file.size > 5 * 1024 * 1024:
-                return {"success": False, "message": "File size must be less than 5MB"}, 400
-            
-            if applicant.payment_proof:
-                old_path = os.path.join(settings.MEDIA_ROOT, applicant.payment_proof)
-                if os.path.exists(old_path):
-                    os.remove(old_path)
-            
-            ext = payment_file.name.split('.')[-1]
-            filename = f"payment_{applicant_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
-            filepath = os.path.join('documents', str(applicant_id), filename)
-            saved_path = default_storage.save(filepath, ContentFile(payment_file.read()))
-            
-            applicant.payment_proof = saved_path
-            applicant.payment_proof_size = payment_file.size
-            applicant.payment_proof_name = payment_file.name
-            applicant.save()  # IMPORTANT: Save to database
-            
-            result['payment_proof'] = saved_path
-            result['payment_proof_size'] = payment_file.size
-            result['payment_proof_name'] = payment_file.name
-        
-        return {
-            "success": True,
-            "message": "Documents uploaded successfully",
-            "data": result
-        }
-        
-    except HttpError:
-        raise
-    except Exception as e:
-        print(f"Error uploading documents: {str(e)}")
-        return {"success": False, "message": f"Failed to upload: {str(e)}"}, 500
-
-        
-
-@router.get("/applicants/{applicant_id}/documents")
-@router.get("/applicants/{applicant_id}/documents/")
-def get_documents(request, applicant_id: int):
-    """Get all documents for an applicant from database"""
+    """Upload documents for an applicant and store in database"""
     try:
         user = get_user_from_token(request)
         
@@ -2531,24 +3003,139 @@ def get_documents(request, applicant_id: int):
             return {
                 "success": False,
                 "message": "Applicant not found"
-            }, 404
+            }
         
-        # Return stored document paths from the applicant record
+        result = {}
+        
+        # Helper function to process file to base64
+        def process_file_to_base64(file_field, doc_type):
+            if file_field in request.FILES:
+                uploaded_file = request.FILES[file_field]
+                if uploaded_file.size > 5 * 1024 * 1024:
+                    return None, "File size must be less than 5MB"
+                
+                # Read file content and convert to base64
+                file_content = uploaded_file.read()
+                file_base64 = base64.b64encode(file_content).decode('utf-8')
+                
+                return {
+                    'content': file_content,
+                    'base64': file_base64,
+                    'name': uploaded_file.name,
+                    'size': uploaded_file.size,
+                    'type': uploaded_file.content_type
+                }, None
+            
+            return None, None
+        
+        # Handle MSCE certificate upload
+        msce_data, error = process_file_to_base64('msce', 'msce')
+        if msce_data:
+            applicant.msce_content = msce_data['content']
+            applicant.msce_base64 = msce_data['base64']
+            applicant.msce_name = msce_data['name']
+            applicant.msce_size = msce_data['size']
+            applicant.msce_type = msce_data['type']
+            applicant.save()
+            result['msce'] = {
+                'name': msce_data['name'],
+                'size': msce_data['size'],
+                'type': msce_data['type']
+            }
+        elif error:
+            return {"success": False, "message": error}
+        
+        # Handle ID Card upload
+        id_card_data, error = process_file_to_base64('id_card', 'id_card')
+        if id_card_data:
+            applicant.id_card_content = id_card_data['content']
+            applicant.id_card_base64 = id_card_data['base64']
+            applicant.id_card_name = id_card_data['name']
+            applicant.id_card_size = id_card_data['size']
+            applicant.id_card_type = id_card_data['type']
+            applicant.save()
+            result['id_card'] = {
+                'name': id_card_data['name'],
+                'size': id_card_data['size'],
+                'type': id_card_data['type']
+            }
+        
+        # Handle Payment Proof upload
+        payment_data, error = process_file_to_base64('payment_proof', 'payment_proof')
+        if payment_data:
+            applicant.payment_proof_content = payment_data['content']
+            applicant.payment_proof_base64 = payment_data['base64']
+            applicant.payment_proof_name = payment_data['name']
+            applicant.payment_proof_size = payment_data['size']
+            applicant.payment_proof_type = payment_data['type']
+            applicant.save()
+            result['payment_proof'] = {
+                'name': payment_data['name'],
+                'size': payment_data['size'],
+                'type': payment_data['type']
+            }
+        
+        return {
+            "success": True,
+            "message": "Documents uploaded and stored in database successfully",
+            "data": result
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error uploading documents: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to upload: {str(e)}"
+        }
+
+
+@router.get("/applicants/{applicant_id}/documents")
+@router.get("/applicants/{applicant_id}/documents/")
+def get_documents(request, applicant_id: int):
+    """Get all documents for an applicant from database (returns base64)"""
+    try:
+        user = get_user_from_token(request)
+        
+        try:
+            applicant = Applicant.objects.get(id=applicant_id, user=user)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Applicant not found"
+            }
+        
+        # Return document data from database fields
         result = {
-            "msce": applicant.msce,
-            "msce_size": applicant.msce_size,
-            "msce_name": applicant.msce_name,
-            "id_card": applicant.id_card,
-            "id_card_size": applicant.id_card_size,
-            "id_card_name": applicant.id_card_name,
-            "payment_proof": applicant.payment_proof,
-            "payment_proof_size": applicant.payment_proof_size,
-            "payment_proof_name": applicant.payment_proof_name
+            "msce": {
+                "base64": applicant.msce_base64,
+                "name": applicant.msce_name,
+                "size": applicant.msce_size,
+                "type": applicant.msce_type,
+                "has_content": bool(applicant.msce_content)
+            } if applicant.msce_base64 or applicant.msce_content else None,
+            "id_card": {
+                "base64": applicant.id_card_base64,
+                "name": applicant.id_card_name,
+                "size": applicant.id_card_size,
+                "type": applicant.id_card_type,
+                "has_content": bool(applicant.id_card_content)
+            } if applicant.id_card_base64 or applicant.id_card_content else None,
+            "payment_proof": {
+                "base64": applicant.payment_proof_base64,
+                "name": applicant.payment_proof_name,
+                "size": applicant.payment_proof_size,
+                "type": applicant.payment_proof_type,
+                "has_content": bool(applicant.payment_proof_content)
+            } if applicant.payment_proof_base64 or applicant.payment_proof_content else None
         }
         
         return {
             "success": True,
-            "message": "Documents retrieved successfully",
+            "message": "Documents retrieved successfully from database",
             "data": result
         }
         
@@ -2559,13 +3146,14 @@ def get_documents(request, applicant_id: int):
         return {
             "success": False,
             "message": f"Failed to get documents: {str(e)}"
-        }, 500
+        }
+
 
 
 @router.delete("/applicants/{applicant_id}/documents/{field}")
 @router.delete("/applicants/{applicant_id}/documents/{field}/")
 def delete_document(request, applicant_id: int, field: str):
-    """Delete a specific document for an applicant"""
+    """Delete a specific document from database for an applicant"""
     try:
         user = get_user_from_token(request)
         
@@ -2585,35 +3173,24 @@ def delete_document(request, applicant_id: int, field: str):
                 "message": "Applicant not found"
             }, 404
         
-        # Get the document path from the applicant record
-        doc_path = getattr(applicant, field, None)
+        # Clear the database fields for the document
+        setattr(applicant, f"{field}_content", None)
+        setattr(applicant, f"{field}_base64", None)
+        setattr(applicant, f"{field}_name", None)
+        setattr(applicant, f"{field}_size", None)
+        setattr(applicant, f"{field}_type", None)
         
-        if not doc_path:
-            return {
-                "success": False,
-                "message": f"No {field} document found to delete"
-            }, 404
-        
-        # Delete the physical file
-        if doc_path:
-            file_path = os.path.join(settings.MEDIA_ROOT, doc_path)
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                    print(f"✅ Deleted physical file: {file_path}")
-                except Exception as e:
-                    print(f"Error deleting file: {e}")
-        
-        # Remove the fields from the applicant record
+        # Also clear legacy path fields if they exist
         setattr(applicant, field, None)
         setattr(applicant, f"{field}_size", None)
         setattr(applicant, f"{field}_name", None)
+        
         applicant.save()
-        print(f"✅ Removed {field} reference from applicant record")
+        print(f"✅ Deleted {field} document from database for applicant {applicant_id}")
         
         return {
             "success": True,
-            "message": f"{field.replace('_', ' ').title()} document deleted successfully"
+            "message": f"{field.replace('_', ' ').title()} document deleted successfully from database"
         }
         
     except HttpError:
@@ -2844,7 +3421,7 @@ def dashboard_stats(request):
 @router.post("/application-fees", response={200: dict, 400: dict, 401: dict})
 @router.post("/application-fees/", response={200: dict, 400: dict, 401: dict})
 def submit_application_fees(request):
-    """Handle application fee submission and save to FeePayment model"""
+    """Handle application fee submission and store in database"""
     try:
         user = get_user_from_token(request)
         print(f"📝 Processing application fee for user {user.username}")
@@ -2870,45 +3447,43 @@ def submit_application_fees(request):
                 "message": "File size must be less than 5MB"
             }
         
-        fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees', str(user.id))
-        os.makedirs(fees_dir, exist_ok=True)
+        # Read file and convert to base64 for database storage
+        file_content = deposit_slip.read()
+        file_base64 = base64.b64encode(file_content).decode('utf-8')
         
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        ext = deposit_slip.name.split('.')[-1]
-        filename = f"deposit_slip_{user.id}_{timestamp}.{ext}"
-        filepath = os.path.join('fees', str(user.id), filename)
-        
-        # Save the file
-        saved_path = default_storage.save(filepath, ContentFile(deposit_slip.read()))
-        
-        # CRITICAL: Save to FeePayment model
+        # Save to FeePayment model (database storage)
         fee_payment, created = FeePayment.objects.get_or_create(user=user)
-        fee_payment.deposit_slip_path = saved_path  # Store the path
+        fee_payment.deposit_slip_content = file_content
+        fee_payment.deposit_slip_base64 = file_base64
+        fee_payment.deposit_slip_name = deposit_slip.name
+        fee_payment.deposit_slip_size = deposit_slip.size
+        fee_payment.deposit_slip_type = deposit_slip.content_type
         fee_payment.status = 'pending'
-        fee_payment.amount = 25000  # Or get from request
-        fee_payment.uploaded_at = datetime.now()
+        fee_payment.amount = 25000
         fee_payment.save()
         
-        print(f"✅ Saved fee payment to database: ID={fee_payment.id}, Path={saved_path}")
+        print(f"✅ Saved fee payment to database: ID={fee_payment.id}")
         
-        # Also update the Applicant model's payment_proof field for compatibility
+        # Also update the Applicant model's payment_proof fields for compatibility
         try:
             applicant = Applicant.objects.get(user=user)
-            applicant.payment_proof = saved_path
+            applicant.payment_proof_content = file_content
+            applicant.payment_proof_base64 = file_base64
             applicant.payment_proof_name = deposit_slip.name
             applicant.payment_proof_size = deposit_slip.size
+            applicant.payment_proof_type = deposit_slip.content_type
             applicant.save()
-            print(f"✅ Updated Applicant payment_proof field")
+            print(f"✅ Updated Applicant payment_proof fields")
         except Applicant.DoesNotExist:
             print(f"⚠️ Applicant not found for user {user.username}")
         
         return {
             "success": True,
-            "message": "Deposit slip submitted successfully!",
+            "message": "Deposit slip submitted and stored in database successfully!",
             "data": {
-                "file_path": saved_path,
                 "file_name": deposit_slip.name,
                 "file_size": deposit_slip.size,
+                "file_type": deposit_slip.content_type,
                 "status": "pending"
             }
         }
@@ -2925,34 +3500,30 @@ def submit_application_fees(request):
         }
 
 
+# In your api.py, update the application-fees endpoints to handle both GET and POST:
+
 @router.get("/application-fees", response={200: dict, 401: dict})
 @router.get("/application-fees/", response={200: dict, 401: dict})
 def get_application_fees(request):
-    """Get application fee status for the current user"""
+    """Get application fee status from database for the current user"""
     try:
         user = get_user_from_token(request)
         print(f"📝 Fetching application fee status for user {user.username}")
         
-        # First check FeePayment model
         from .models import FeePayment
-        import os
-        from django.conf import settings
         
         try:
             fee_payment = FeePayment.objects.get(user=user)
             
-            # Check if the file actually exists
-            file_exists = False
-            if fee_payment.deposit_slip_path:
-                full_path = os.path.join(settings.MEDIA_ROOT, fee_payment.deposit_slip_path)
-                file_exists = os.path.exists(full_path)
-            
+            # Return data from database
             return {
                 "success": True,
                 "data": {
                     "status": fee_payment.status,
-                    "deposit_slip_path": fee_payment.deposit_slip_path if file_exists else None,
-                    "file_path": fee_payment.deposit_slip_path if file_exists else None,
+                    "deposit_slip_name": fee_payment.deposit_slip_name,
+                    "deposit_slip_size": fee_payment.deposit_slip_size,
+                    "deposit_slip_type": fee_payment.deposit_slip_type,
+                    "has_content": bool(fee_payment.deposit_slip_content),
                     "uploaded_at": fee_payment.uploaded_at.isoformat() if fee_payment.uploaded_at else None,
                     "amount": float(fee_payment.amount)
                 }
@@ -2960,45 +3531,25 @@ def get_application_fees(request):
         except FeePayment.DoesNotExist:
             print(f"⚠️ No FeePayment record found for user {user.username}")
         
-        # Check Applicant model's payment_proof field as fallback
+        # Check Applicant model as fallback
         try:
             from .models import Applicant
             applicant = Applicant.objects.get(user=user)
-            if applicant.payment_proof:
-                print(f"✅ Found payment_proof in Applicant model: {applicant.payment_proof}")
+            if applicant.payment_proof_content:
                 return {
                     "success": True,
                     "data": {
                         "status": "pending",
-                        "deposit_slip_path": applicant.payment_proof,
-                        "file_path": applicant.payment_proof,
-                        "file_name": applicant.payment_proof_name,
+                        "deposit_slip_name": applicant.payment_proof_name,
+                        "deposit_slip_size": applicant.payment_proof_size,
+                        "deposit_slip_type": applicant.payment_proof_type,
+                        "has_content": bool(applicant.payment_proof_content),
                         "uploaded_at": applicant.application_date.isoformat() if applicant.application_date else None,
                         "amount": 25000
                     }
                 }
         except Applicant.DoesNotExist:
             pass
-        
-        # Check if file exists in media directory
-        fees_dir = os.path.join(settings.MEDIA_ROOT, 'fees', str(user.id))
-        if os.path.exists(fees_dir):
-            files = os.listdir(fees_dir)
-            deposit_slips = [f for f in files if f.startswith('deposit_slip_')]
-            if deposit_slips:
-                latest_slip = sorted(deposit_slips)[-1]
-                print(f"✅ Found deposit slip file in directory: {latest_slip}")
-                return {
-                    "success": True,
-                    "data": {
-                        "status": "pending",
-                        "deposit_slip_path": os.path.join('fees', str(user.id), latest_slip),
-                        "file_path": os.path.join('fees', str(user.id), latest_slip),
-                        "file_name": latest_slip,
-                        "uploaded_at": datetime.fromtimestamp(os.path.getmtime(os.path.join(fees_dir, latest_slip))).isoformat(),
-                        "amount": 25000
-                    }
-                }
         
         return {
             "success": True,
@@ -3017,8 +3568,88 @@ def get_application_fees(request):
         }
 
 
-
+@router.post("/application-fees", response={200: dict, 400: dict, 401: dict})
+@router.post("/application-fees/", response={200: dict, 400: dict, 401: dict})
+def submit_application_fees(request):
+    """Handle application fee submission and store in database"""
+    try:
+        user = get_user_from_token(request)
+        print(f"📝 Processing application fee for user {user.username}")
         
+        if 'deposit_slip' not in request.FILES:
+            return {
+                "success": False,
+                "message": "Deposit slip is required"
+            }
+        
+        deposit_slip = request.FILES['deposit_slip']
+        
+        allowed_types = ['image/jpeg', 'image/jpg', 'image/png', 'application/pdf']
+        if deposit_slip.content_type not in allowed_types:
+            return {
+                "success": False,
+                "message": "Invalid file type. Please upload JPG, PNG, or PDF"
+            }
+        
+        if deposit_slip.size > 5 * 1024 * 1024:
+            return {
+                "success": False,
+                "message": "File size must be less than 5MB"
+            }
+        
+        # Read file and convert to base64 for database storage
+        file_content = deposit_slip.read()
+        file_base64 = base64.b64encode(file_content).decode('utf-8')
+        
+        # Save to FeePayment model (database storage)
+        fee_payment, created = FeePayment.objects.get_or_create(user=user)
+        fee_payment.deposit_slip_content = file_content
+        fee_payment.deposit_slip_base64 = file_base64
+        fee_payment.deposit_slip_name = deposit_slip.name
+        fee_payment.deposit_slip_size = deposit_slip.size
+        fee_payment.deposit_slip_type = deposit_slip.content_type
+        fee_payment.status = 'pending'
+        fee_payment.amount = 25000
+        fee_payment.save()
+        
+        print(f"✅ Saved fee payment to database: ID={fee_payment.id}")
+        
+        # Also update the Applicant model's payment_proof fields for compatibility
+        try:
+            applicant = Applicant.objects.get(user=user)
+            applicant.payment_proof_content = file_content
+            applicant.payment_proof_base64 = file_base64
+            applicant.payment_proof_name = deposit_slip.name
+            applicant.payment_proof_size = deposit_slip.size
+            applicant.payment_proof_type = deposit_slip.content_type
+            applicant.save()
+            print(f"✅ Updated Applicant payment_proof fields")
+        except Applicant.DoesNotExist:
+            print(f"⚠️ Applicant not found for user {user.username}")
+        
+        return {
+            "success": True,
+            "message": "Deposit slip submitted and stored in database successfully!",
+            "data": {
+                "file_name": deposit_slip.name,
+                "file_size": deposit_slip.size,
+                "file_type": deposit_slip.content_type,
+                "status": "pending"
+            }
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"❌ Error submitting application fees: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"Failed to submit deposit slip: {str(e)}"
+        }
+        
+                        
 # ==================== GET SINGLE APPLICANT ENDPOINT ====================
 
 @router.get("/applicants/{applicant_id}", response={200: dict, 404: dict, 401: dict})
@@ -8051,14 +8682,12 @@ def update_eligibility_criteria(request, programme_id: int, data: EligibilityCri
             "success": False,
             "message": str(e)
         }
-
-
 @router.get("/eligibility/check/{applicant_id}")
 @router.get("/eligibility/check/{applicant_id}/")
 @router.post("/eligibility/check/{applicant_id}")
 @router.post("/eligibility/check/{applicant_id}/")
 def check_eligibility(request, applicant_id: int):
-    """Auto-check eligibility for an applicant"""
+    """Auto-check eligibility for an applicant based on BEST 6 subjects"""
     try:
         user = get_user_from_token(request)
         
@@ -8072,93 +8701,155 @@ def check_eligibility(request, applicant_id: int):
                 "message": "Applicant not found"
             }
         
-        
         # Get subject records
         subject_records = SubjectRecord.objects.filter(user=applicant.user)
         
-        # Grade to points mapping
+        if not subject_records.exists():
+            return {
+                "success": True,
+                "message": "No subject records found",
+                "data": {
+                    "eligible": False,
+                    "auto_eligible": False,
+                    "manually_overridden": False,
+                    "checks_passed": [],
+                    "checks_failed": ["No MSCE subject records found"],
+                    "score": 0,
+                    "grade_point_average": 0,
+                    "subjects_count": 0,
+                    "credits_count": 0,
+                    "total_points": 0,
+                    "best_six_points": 0,
+                    "total_subjects_submitted": 0,
+                    "warnings": ["Please add your MSCE subject records"],
+                    "recommendations": ["Add your MSCE subject records to check eligibility"],
+                    "subject_breakdown": []
+                }
+            }
+        
+        # MALAWI MSCE GRADE TO POINTS MAPPING (Standard system)
+        # Lower points = better grade
+        # A* = 1, A = 1, B = 2, C = 3, D = 4, E = 5, F = 6, O = 7, P = 8, U = 9
         grade_to_points = {
-            '1': 1, '2': 2, '3': 3, '4': 4, '5': 5,
-            '6': 6, '7': 7, '8': 8, '9': 9, 'U': 10,
-            'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'F': 6
+            'A*': 1, 'A': 1,
+            'B': 2,
+            'C': 3,
+            'D': 4,
+            'E': 5,
+            'F': 6,
+            'O': 7,
+            'P': 8,
+            'U': 9,
+            'X': 10,  # No result
+            'Y': 10   # Absent
         }
         
-        # Calculate metrics
-        grades = []
-        credits = 0
-        subjects_list = []
-        
+        # Calculate points for ALL subjects
+        all_subjects = []
         for record in subject_records:
-            grade = str(record.grade).upper()
+            grade = str(record.grade).upper().strip()
+            # Clean grade - remove any extra characters
+            grade = grade.replace('*', '').strip()
+            if grade in ['A*', 'A']:
+                grade = 'A'
+            
             points = grade_to_points.get(grade, 5)
-            grades.append(points)
-            subjects_list.append(record.subject.lower())
-            if points <= 3:  # Credit or better
-                credits += 1
+            
+            # Determine if credit (Grade C or better)
+            is_credit = grade in ['A', 'B', 'C']
+            
+            all_subjects.append({
+                'subject': record.subject,
+                'grade': grade,
+                'points': points,
+                'is_credit': is_credit,
+                'raw_grade': record.grade
+            })
         
-        subjects_count = len(grades)
-        total_points = sum(grades)
+        # Sort subjects by points (lower = better) and take best 6
+        sorted_subjects = sorted(all_subjects, key=lambda x: (x['points'], x['subject']))
+        best_six = sorted_subjects[:6]
+        
+        # Calculate metrics based on BEST 6 subjects
+        subjects_count = len(best_six)
+        credits_count = sum(1 for s in best_six if s['is_credit'])
+        total_points = sum(s['points'] for s in best_six)
         grade_point_average = total_points / subjects_count if subjects_count > 0 else 0
+        
+        # Calculate average points per subject
+        avg_points_per_subject = total_points / subjects_count if subjects_count > 0 else 0
         
         # Get programme criteria
         programme_id = applicant.selected_programme_id or 1
         criteria = get_programme_criteria_sync(programme_id)
         
-        # Perform eligibility checks
+        # Perform eligibility checks based on BEST 6
         checks_passed = []
         checks_failed = []
         warnings = []
         recommendations = []
         
-        # Check 1: Minimum subjects
+        # Check 1: Minimum subjects (must be 6)
         min_subjects = criteria.get('min_subjects', 6)
         if subjects_count >= min_subjects:
-            checks_passed.append(f"Has {subjects_count} subjects (minimum {min_subjects})")
+            checks_passed.append(f"Has {subjects_count} subjects in best 6 (minimum {min_subjects})")
         else:
-            checks_failed.append(f"Only {subjects_count} subjects (need {min_subjects})")
-            warnings.append(f"Add {min_subjects - subjects_count} more subjects")
+            checks_failed.append(f"Only {subjects_count} subjects submitted (need {min_subjects})")
+            warnings.append(f"You need to submit {min_subjects - subjects_count} more subjects")
+            recommendations.append(f"Add {min_subjects - subjects_count} more MSCE subjects to meet the minimum requirement")
         
-        # Check 2: Minimum credits
+        # Check 2: Minimum credits from best 6
         min_credits = criteria.get('min_credits', 4)
-        if credits >= min_credits:
-            checks_passed.append(f"Has {credits} credits (minimum {min_credits})")
+        if credits_count >= min_credits:
+            checks_passed.append(f"Has {credits_count} credits in best 6 (minimum {min_credits})")
         else:
-            checks_failed.append(f"Only {credits} credits (need {min_credits})")
-            recommendations.append(f"Aim for at least {min_credits} credits")
+            checks_failed.append(f"Only {credits_count} credits in best 6 (need {min_credits})")
+            warnings.append(f"Need {min_credits - credits_count} more credit passes")
+            recommendations.append(f"Improve {min_credits - credits_count} more subjects to Grade C or better")
         
-        # Check 3: Total points
+        # Check 3: Total points from best 6
         max_points = criteria.get('max_points', 30)
         if total_points <= max_points:
-            checks_passed.append(f"Total points: {total_points} (within limit of {max_points})")
+            checks_passed.append(f"Total points from best 6: {total_points} (within limit of {max_points})")
         else:
-            checks_failed.append(f"Total points: {total_points} (exceeds limit of {max_points})")
-            recommendations.append("Improve grades to reduce total points")
-        
-        # Check 4: Required subjects
-        required_subjects = [s.lower() for s in criteria.get('required_subjects', [])]
-        missing_required = [s for s in required_subjects if s not in subjects_list]
-        if not missing_required:
-            checks_passed.append("All required subjects completed")
-        else:
-            checks_failed.append(f"Missing required subjects: {', '.join(missing_required)}")
-            recommendations.append(f"Complete the following subjects: {', '.join(missing_required)}")
+            checks_failed.append(f"Total points from best 6: {total_points} (exceeds limit of {max_points})")
+            warnings.append(f"Total points ({total_points}) exceed the maximum allowed ({max_points})")
+            recommendations.append("Improve your grades to reduce total points (aim for more A, B, C grades)")
         
         # Calculate eligibility score (0-100)
         score = 0
-        if subjects_count >= min_subjects:
-            score += 20
-        if credits >= min_credits:
-            score += 20
-        if total_points <= max_points:
-            score += 20
-        if not missing_required:
-            score += 20
         
-        # Bonus for good GPA
-        if grade_point_average <= 3:
+        # Subjects score (max 20) - must have 6 subjects
+        if subjects_count >= 6:
             score += 20
-        elif grade_point_average <= 4:
+        else:
+            score += (subjects_count / 6) * 20
+        
+        # Credits score (max 35)
+        if credits_count >= min_credits:
+            score += 35
+        else:
+            score += (credits_count / min_credits) * 35
+        
+        # Points score (max 35) - lower is better
+        target_points = 18  # 3 points per subject on average is good (18/6 = 3.0)
+        if total_points <= target_points:
+            score += 35
+        elif total_points <= max_points:
+            # Scale between target_points and max_points
+            points_ratio = 1 - (total_points - target_points) / (max_points - target_points)
+            score += points_ratio * 35
+        else:
+            score += 0
+        
+        # Bonus for low points (excellent performance)
+        if total_points <= 12:  # Average 2 points per subject (mostly As)
             score += 10
+        
+        score = min(100, round(score, 1))
+        
+        # Determine auto eligibility
+        auto_eligible = subjects_count >= 6 and credits_count >= min_credits and total_points <= max_points
         
         # Check for manual override
         override = EligibilityOverride.objects.filter(
@@ -8167,8 +8858,90 @@ def check_eligibility(request, applicant_id: int):
         ).first()
         
         is_manually_overridden = override is not None
-        auto_eligible = len(checks_failed) == 0
         eligible = auto_eligible or (is_manually_overridden and override.eligible)
+        
+        # Prepare subject breakdown
+        subject_breakdown = []
+        for i, subject in enumerate(sorted_subjects):
+            is_in_best_six = i < 6
+            subject_breakdown.append({
+                "subject": subject['subject'],
+                "grade": subject['grade'],
+                "points": subject['points'],
+                "is_credit": subject['is_credit'],
+                "in_best_six": is_in_best_six,
+                "rank": i + 1 if is_in_best_six else None
+            })
+        
+        # Prepare programme eligibility
+        programme_eligibility = []
+        try:
+            # Get all programmes or just the selected one
+            if applicant.selected_programme:
+                programmes_to_check = [applicant.selected_programme]
+            else:
+                programmes_to_check = Programme.objects.filter(is_active=True)[:5]
+            
+            for prog in programmes_to_check:
+                prog_criteria = get_programme_criteria_sync(prog.id)
+                prog_min_credits = prog_criteria.get('min_credits', 4)
+                prog_max_points = prog_criteria.get('max_points', 30)
+                prog_required_subjects = [s.lower() for s in prog_criteria.get('required_subjects', [])]
+                
+                # Check if eligible for this programme
+                prog_eligible = subjects_count >= 6 and credits_count >= prog_min_credits and total_points <= prog_max_points
+                
+                # Check required subjects
+                prog_missing = [s for s in prog_required_subjects if s not in [sub['subject'].lower() for sub in best_six]]
+                prog_requirements_met = []
+                prog_requirements_missing = []
+                
+                if credits_count >= prog_min_credits:
+                    prog_requirements_met.append(f"Credits: {credits_count}/{prog_min_credits}")
+                else:
+                    prog_requirements_missing.append(f"Need {prog_min_credits - credits_count} more credits")
+                
+                if total_points <= prog_max_points:
+                    prog_requirements_met.append(f"Points: {total_points}/{prog_max_points}")
+                else:
+                    prog_requirements_missing.append(f"Reduce points by {total_points - prog_max_points}")
+                
+                if not prog_missing:
+                    prog_requirements_met.append("All required subjects present")
+                else:
+                    prog_requirements_missing.append(f"Missing: {', '.join(prog_missing)}")
+                
+                # Calculate programme score
+                prog_score = 0
+                if credits_count >= prog_min_credits:
+                    prog_score += 50
+                else:
+                    prog_score += (credits_count / prog_min_credits) * 50
+                
+                if total_points <= prog_max_points:
+                    prog_score += 50
+                else:
+                    points_ratio = max(0, 1 - (total_points - prog_max_points) / prog_max_points)
+                    prog_score += points_ratio * 50
+                
+                prog_score = round(prog_score, 1)
+                
+                programme_eligibility.append({
+                    "programme_id": prog.id,
+                    "programme_name": prog.name,
+                    "programme_code": prog.code or "",
+                    "department": prog.department.name if prog.department else "",
+                    "faculty": "",
+                    "eligible": prog_eligible,
+                    "score": prog_score,
+                    "requirements_met": prog_requirements_met,
+                    "requirements_missing": prog_requirements_missing,
+                    "points_required": prog_max_points,
+                    "points_obtained": total_points,
+                    "subject_requirements": []
+                })
+        except Exception as prog_err:
+            print(f"Error building programme eligibility: {prog_err}")
         
         # Log the check
         EligibilityLog.objects.create(
@@ -8176,7 +8949,7 @@ def check_eligibility(request, applicant_id: int):
             programme_id=programme_id,
             programme_name=criteria.get('programme_name', ''),
             action='auto_check',
-            previous_status=not auto_eligible,
+            previous_status=False,
             new_status=auto_eligible,
             performed_by=user.email,
             eligibility_score=score
@@ -8196,10 +8969,15 @@ def check_eligibility(request, applicant_id: int):
                 "score": score,
                 "grade_point_average": round(grade_point_average, 2),
                 "subjects_count": subjects_count,
-                "credits_count": credits,
+                "credits_count": credits_count,
                 "total_points": total_points,
+                "best_six_points": total_points,
+                "total_subjects_submitted": len(all_subjects),
+                "avg_points_per_subject": round(avg_points_per_subject, 2),
                 "warnings": warnings,
-                "recommendations": recommendations
+                "recommendations": recommendations,
+                "subject_breakdown": subject_breakdown,
+                "programme_eligibility": programme_eligibility
             }
         }
         
@@ -8211,8 +8989,8 @@ def check_eligibility(request, applicant_id: int):
             "success": False,
             "message": str(e)
         }
-
-
+        
+                
 @router.post("/eligibility/override/{applicant_id}")
 @router.post("/eligibility/override/{applicant_id}/")
 def override_eligibility(request, applicant_id: int, data: EligibilityOverrideSchema):
@@ -8368,6 +9146,773 @@ def batch_check_eligibility(request):
             "success": False,
             "message": str(e)
         }         
+
+# Add this after your existing endpoints (before the final api.add_router lines)
+
+# ==================== ELIGIBILITY CRITERIA MODELS ====================
+# First, you need to add these models to your models.py
+
+"""
+Add to models.py:
+
+class EligibilityCriteria(models.Model):
+    programme = models.OneToOneField('Programme', on_delete=models.CASCADE, related_name='eligibility_criteria')
+    min_subjects = models.IntegerField(default=6, help_text="Minimum number of MSCE subjects")
+    min_credits = models.IntegerField(default=4, help_text="Minimum number of credit passes (Grade C or better)")
+    max_points = models.IntegerField(default=30, help_text="Maximum total points allowed (lower is better)")
+    required_subjects = models.JSONField(default=list, help_text="List of required subject names")
+    preferred_subjects = models.JSONField(default=list, help_text="List of preferred subject names")
+    subject_weights = models.JSONField(default=dict, help_text="Weight for each subject in scoring")
+    is_active = models.BooleanField(default=True)
+    updated_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    def __str__(self):
+        return f"Eligibility criteria for {self.programme.name}"
+
+class EligibilityOverride(models.Model):
+    applicant = models.ForeignKey('Applicant', on_delete=models.CASCADE, related_name='eligibility_overrides')
+    programme = models.ForeignKey('Programme', on_delete=models.CASCADE, null=True, blank=True)
+    programme_id = models.IntegerField(null=True, blank=True)
+    eligible = models.BooleanField(default=False)
+    reason = models.TextField()
+    notes = models.TextField(blank=True)
+    performed_by = models.CharField(max_length=255)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = ['applicant', 'programme_id']
+
+class EligibilityLog(models.Model):
+    applicant = models.ForeignKey('Applicant', on_delete=models.CASCADE, related_name='eligibility_logs')
+    programme_id = models.IntegerField()
+    programme_name = models.CharField(max_length=255)
+    action = models.CharField(max_length=50)  # auto_check, manual_override
+    previous_status = models.BooleanField()
+    new_status = models.BooleanField()
+    reason = models.TextField(blank=True)
+    performed_by = models.CharField(max_length=255)
+    eligibility_score = models.FloatField(default=0)
+    performed_at = models.DateTimeField(auto_now_add=True)
+    
+    def __str__(self):
+        return f"{self.action} for applicant {self.applicant_id} at {self.performed_at}"
+"""
+
+# ==================== ELIGIBILITY SCHEMAS ====================
+
+class EligibilityCriteriaSchema(Schema):
+    programme_id: int
+    min_subjects: int = 6
+    min_credits: int = 4
+    max_points: int = 30
+    required_subjects: List[str] = []
+    preferred_subjects: List[str] = []
+    subject_weights: Optional[Dict[str, float]] = None
+
+class EligibilityOverrideSchema(Schema):
+    eligible: bool
+    reason: str
+    notes: Optional[str] = None
+
+class EligibilityCheckResultSchema(Schema):
+    eligible: bool
+    auto_eligible: bool
+    manually_overridden: bool
+    overridden_by: Optional[str] = None
+    overridden_at: Optional[str] = None
+    override_reason: Optional[str] = None
+    checks_passed: List[str]
+    checks_failed: List[str]
+    score: float
+    grade_point_average: float
+    subjects_count: int
+    credits_count: int
+    total_points: int
+    warnings: List[str]
+    recommendations: List[str]
+
+class BatchEligibilityResponseSchema(Schema):
+    summary: dict
+    results: List[dict]
+
+
+# ==================== HELPER FUNCTION ====================
+
+def get_programme_criteria_sync(programme_id: int) -> dict:
+    """Get eligibility criteria for a programme (sync version)"""
+    from .models import Programme, EligibilityCriteria
+    
+    try:
+        programme = Programme.objects.get(id=programme_id)
+        criteria, created = EligibilityCriteria.objects.get_or_create(
+            programme=programme,
+            defaults={
+                'min_subjects': 6,
+                'min_credits': 4,
+                'max_points': 30,
+                'required_subjects': [],
+                'preferred_subjects': []
+            }
+        )
+        
+        return {
+            'programme_id': programme.id,
+            'programme_name': programme.name,
+            'min_subjects': criteria.min_subjects,
+            'min_credits': criteria.min_credits,
+            'max_points': criteria.max_points,
+            'required_subjects': criteria.required_subjects or [],
+            'preferred_subjects': criteria.preferred_subjects or []
+        }
+    except Exception as e:
+        print(f"Error getting criteria: {e}")
+        return {
+            'programme_id': programme_id,
+            'programme_name': 'Unknown',
+            'min_subjects': 6,
+            'min_credits': 4,
+            'max_points': 30,
+            'required_subjects': [],
+            'preferred_subjects': []
+        }
+
+
+def calculate_grade_points(grade: str) -> int:
+    """Convert grade to points (lower is better)"""
+    grade_to_points = {
+        'A*': 1, 'A': 1, 'A*': 1,
+        'B': 2,
+        'C': 3,
+        'D': 4,
+        'E': 5,
+        'F': 6,
+        'U': 7,
+        'O': 8, 'P': 8
+    }
+    return grade_to_points.get(str(grade).upper(), 5)
+
+
+def is_credit_pass(grade: str) -> bool:
+    """Check if a grade is a credit pass (C or better)"""
+    credit_grades = ['A*', 'A', 'B', 'C']
+    return str(grade).upper() in credit_grades
+
+
+# ==================== ELIGIBILITY CRITERIA ENDPOINTS ====================
+
+@router.get("/eligibility/criteria", response={200: dict, 401: dict})
+@router.get("/eligibility/criteria/", response={200: dict, 401: dict})
+def get_all_eligibility_criteria(request):
+    """Get all eligibility criteria for all programmes"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Programme, EligibilityCriteria
+        
+        # Get all programmes with their criteria
+        programmes = Programme.objects.filter(is_active=True)
+        
+        criteria_list = []
+        for programme in programmes:
+            criteria, created = EligibilityCriteria.objects.get_or_create(
+                programme=programme,
+                defaults={
+                    'min_subjects': 6,
+                    'min_credits': 4,
+                    'max_points': 30,
+                    'required_subjects': [],
+                    'preferred_subjects': []
+                }
+            )
+            
+            criteria_list.append({
+                "id": criteria.id,
+                "programme_id": programme.id,
+                "programme_name": programme.name,
+                "programme_code": programme.code,
+                "min_subjects": criteria.min_subjects,
+                "min_credits": criteria.min_credits,
+                "max_points": criteria.max_points,
+                "required_subjects": criteria.required_subjects or [],
+                "preferred_subjects": criteria.preferred_subjects or [],
+                "is_active": criteria.is_active,
+                "created_at": criteria.created_at.isoformat() if criteria.created_at else None,
+                "updated_at": criteria.updated_at.isoformat() if criteria.updated_at else None
+            })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(criteria_list)} eligibility criteria",
+            "data": criteria_list,
+            "count": len(criteria_list)
+        }
+        
+    except Exception as e:
+        print(f"Error fetching eligibility criteria: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": str(e),
+            "data": [],
+            "count": 0
+        }
+
+
+@router.get("/eligibility/criteria/{programme_id}", response={200: dict, 401: dict, 404: dict})
+@router.get("/eligibility/criteria/{programme_id}/", response={200: dict, 401: dict, 404: dict})
+def get_eligibility_criteria_by_programme(request, programme_id: int):
+    """Get eligibility criteria for a specific programme"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Programme, EligibilityCriteria
+        
+        try:
+            programme = Programme.objects.get(id=programme_id)
+        except Programme.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"Programme with ID {programme_id} not found"
+            }
+        
+        # Get or create criteria
+        criteria, created = EligibilityCriteria.objects.get_or_create(
+            programme=programme,
+            defaults={
+                'min_subjects': 6,
+                'min_credits': 4,
+                'max_points': 30,
+                'required_subjects': [],
+                'preferred_subjects': []
+            }
+        )
+        
+        return {
+            "success": True,
+            "message": "Eligibility criteria retrieved successfully",
+            "data": {
+                "id": criteria.id,
+                "programme_id": programme.id,
+                "programme_name": programme.name,
+                "programme_code": programme.code,
+                "min_subjects": criteria.min_subjects,
+                "min_credits": criteria.min_credits,
+                "max_points": criteria.max_points,
+                "required_subjects": criteria.required_subjects or [],
+                "preferred_subjects": criteria.preferred_subjects or [],
+                "subject_weights": criteria.subject_weights or {},
+                "is_active": criteria.is_active,
+                "updated_by": criteria.updated_by.email if criteria.updated_by else None,
+                "created_at": criteria.created_at.isoformat() if criteria.created_at else None,
+                "updated_at": criteria.updated_at.isoformat() if criteria.updated_at else None
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error fetching eligibility criteria: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.put("/eligibility/criteria/{programme_id}", response={200: dict, 401: dict, 404: dict})
+@router.put("/eligibility/criteria/{programme_id}/", response={200: dict, 401: dict, 404: dict})
+def update_eligibility_criteria(request, programme_id: int, data: EligibilityCriteriaSchema):
+    """Update eligibility criteria for a programme (admin only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Programme, EligibilityCriteria
+        
+        try:
+            programme = Programme.objects.get(id=programme_id)
+        except Programme.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"Programme with ID {programme_id} not found"
+            }
+        
+        # Update or create criteria
+        criteria, created = EligibilityCriteria.objects.update_or_create(
+            programme=programme,
+            defaults={
+                'min_subjects': data.min_subjects,
+                'min_credits': data.min_credits,
+                'max_points': data.max_points,
+                'required_subjects': data.required_subjects,
+                'preferred_subjects': data.preferred_subjects,
+                'subject_weights': data.subject_weights or {},
+                'updated_by': user,
+                'is_active': True
+            }
+        )
+        
+        # Log the change
+        from .models import AuditLog
+        AuditLog.objects.create(
+            user=user,
+            action="eligibility_criteria_updated",
+            resource_type="Programme",
+            resource_id=programme_id,
+            new_value=f"Updated eligibility criteria for {programme.name}",
+            ip_address=request.META.get('REMOTE_ADDR'),
+            user_agent=request.META.get('HTTP_USER_AGENT', '')
+        )
+        
+        return {
+            "success": True,
+            "message": "Eligibility criteria updated successfully",
+            "data": {
+                "id": criteria.id,
+                "programme_id": programme.id,
+                "programme_name": programme.name,
+                "min_subjects": criteria.min_subjects,
+                "min_credits": criteria.min_credits,
+                "max_points": criteria.max_points,
+                "required_subjects": criteria.required_subjects,
+                "preferred_subjects": criteria.preferred_subjects,
+                "is_active": criteria.is_active
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error updating eligibility criteria: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+# ==================== ELIGIBILITY CHECK ENDPOINTS ====================
+
+@router.get("/eligibility/check/{applicant_id}", response={200: dict, 401: dict, 404: dict})
+@router.get("/eligibility/check/{applicant_id}/", response={200: dict, 401: dict, 404: dict})
+def check_applicant_eligibility(request, applicant_id: int):
+    """Auto-check eligibility for an applicant"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Applicant, SubjectRecord, EligibilityOverride, EligibilityLog, Programme
+        
+        try:
+            applicant = Applicant.objects.get(id=applicant_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"Applicant with ID {applicant_id} not found"
+            }
+        
+        # Get subject records
+        subject_records = SubjectRecord.objects.filter(user=applicant.user)
+        
+        if not subject_records.exists():
+            return {
+                "success": True,
+                "message": "No subject records found",
+                "data": {
+                    "eligible": False,
+                    "auto_eligible": False,
+                    "manually_overridden": False,
+                    "checks_passed": [],
+                    "checks_failed": ["No MSCE subject records found"],
+                    "score": 0,
+                    "grade_point_average": 0,
+                    "subjects_count": 0,
+                    "credits_count": 0,
+                    "total_points": 0,
+                    "warnings": ["Please add your MSCE subject records"],
+                    "recommendations": ["Add your MSCE subject records to check eligibility"]
+                }
+            }
+        
+        # Calculate metrics
+        subjects_count = subject_records.count()
+        credits_count = 0
+        total_points = 0
+        subjects_list = []
+        
+        for record in subject_records:
+            grade = str(record.grade).upper()
+            points = calculate_grade_points(grade)
+            total_points += points
+            subjects_list.append(record.subject.lower())
+            if is_credit_pass(grade):
+                credits_count += 1
+        
+        grade_point_average = total_points / subjects_count if subjects_count > 0 else 0
+        
+        # Get programme criteria
+        programme_id = applicant.selected_programme_id or 1
+        if programme_id:
+            try:
+                programme = Programme.objects.get(id=programme_id)
+                criteria = get_programme_criteria_sync(programme_id)
+            except:
+                criteria = get_programme_criteria_sync(1)
+        else:
+            criteria = get_programme_criteria_sync(1)
+        
+        # Perform eligibility checks
+        checks_passed = []
+        checks_failed = []
+        warnings = []
+        recommendations = []
+        
+        # Check 1: Minimum subjects
+        min_subjects = criteria.get('min_subjects', 6)
+        if subjects_count >= min_subjects:
+            checks_passed.append(f"Has {subjects_count} subjects (minimum {min_subjects})")
+        else:
+            checks_failed.append(f"Only {subjects_count} subjects (need {min_subjects})")
+            warnings.append(f"Add {min_subjects - subjects_count} more subjects")
+            recommendations.append(f"Add {min_subjects - subjects_count} more MSCE subjects to meet the minimum requirement")
+        
+        # Check 2: Minimum credits
+        min_credits = criteria.get('min_credits', 4)
+        if credits_count >= min_credits:
+            checks_passed.append(f"Has {credits_count} credits (minimum {min_credits})")
+        else:
+            checks_failed.append(f"Only {credits_count} credits (need {min_credits})")
+            warnings.append(f"Need {min_credits - credits_count} more credit passes")
+            recommendations.append(f"Aim for at least {min_credits} credit passes (Grade C or better)")
+        
+        # Check 3: Total points
+        max_points = criteria.get('max_points', 30)
+        if total_points <= max_points:
+            checks_passed.append(f"Total points: {total_points} (within limit of {max_points})")
+        else:
+            checks_failed.append(f"Total points: {total_points} (exceeds limit of {max_points})")
+            warnings.append(f"Total points ({total_points}) exceed the maximum allowed ({max_points})")
+            recommendations.append("Improve your grades to reduce total points")
+        
+        # Check 4: Required subjects
+        required_subjects = [s.lower() for s in criteria.get('required_subjects', [])]
+        missing_required = [s for s in required_subjects if s not in subjects_list]
+        if not missing_required:
+            checks_passed.append("All required subjects completed")
+        else:
+            checks_failed.append(f"Missing required subjects: {', '.join(missing_required)}")
+            recommendations.append(f"Complete the following subjects: {', '.join(missing_required)}")
+        
+        # Calculate eligibility score (0-100)
+        score = 0
+        score_weights = {
+            'subjects': 25,
+            'credits': 25,
+            'points': 25,
+            'required': 25
+        }
+        
+        # Subjects score
+        subjects_ratio = min(1.0, subjects_count / min_subjects) if min_subjects > 0 else 1.0
+        score += subjects_ratio * score_weights['subjects']
+        
+        # Credits score
+        credits_ratio = min(1.0, credits_count / min_credits) if min_credits > 0 else 1.0
+        score += credits_ratio * score_weights['credits']
+        
+        # Points score (lower is better)
+        points_ratio = max(0, 1 - (total_points - max_points) / max_points) if total_points > max_points else 1.0
+        score += points_ratio * score_weights['points']
+        
+        # Required subjects score
+        required_ratio = 1 - (len(missing_required) / len(required_subjects)) if required_subjects else 1.0
+        score += required_ratio * score_weights['required']
+        
+        score = round(score, 1)
+        
+        # Check for manual override
+        override = EligibilityOverride.objects.filter(
+            applicant=applicant,
+            programme_id=programme_id
+        ).first()
+        
+        is_manually_overridden = override is not None
+        auto_eligible = len(checks_failed) == 0
+        eligible = auto_eligible or (is_manually_overridden and override.eligible)
+        
+        # Log the check
+        EligibilityLog.objects.create(
+            applicant=applicant,
+            programme_id=programme_id,
+            programme_name=criteria.get('programme_name', ''),
+            action='auto_check',
+            previous_status=not auto_eligible,
+            new_status=auto_eligible,
+            performed_by=user.email,
+            eligibility_score=score
+        )
+        
+        return {
+            "success": True,
+            "message": "Eligibility check completed",
+            "data": {
+                "eligible": eligible,
+                "auto_eligible": auto_eligible,
+                "manually_overridden": is_manually_overridden,
+                "overridden_by": override.performed_by if override else None,
+                "overridden_at": override.created_at.isoformat() if override else None,
+                "override_reason": override.reason if override else None,
+                "checks_passed": checks_passed,
+                "checks_failed": checks_failed,
+                "score": score,
+                "grade_point_average": round(grade_point_average, 2),
+                "subjects_count": subjects_count,
+                "credits_count": credits_count,
+                "total_points": total_points,
+                "warnings": warnings,
+                "recommendations": recommendations
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error checking eligibility: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.get("/eligibility/batch-check", response={200: dict, 401: dict})
+@router.get("/eligibility/batch-check/", response={200: dict, 401: dict})
+def batch_check_eligibility(request):
+    """Check eligibility for all applicants"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Applicant
+        
+        # Get all applicants with submissions
+        applicants = Applicant.objects.filter(
+            status__in=['submitted', 'pending', 'under_review']
+        )
+        
+        results = []
+        eligible_count = 0
+        auto_eligible_count = 0
+        ineligible_count = 0
+        
+        for applicant in applicants:
+            try:
+                # Call the eligibility check function
+                check_result = check_applicant_eligibility(request, applicant.id)
+                
+                if check_result.get('success') and check_result.get('data'):
+                    data = check_result['data']
+                    is_eligible = data.get('eligible', False)
+                    is_auto_eligible = data.get('auto_eligible', False)
+                    
+                    if is_eligible:
+                        eligible_count += 1
+                    else:
+                        ineligible_count += 1
+                    
+                    if is_auto_eligible:
+                        auto_eligible_count += 1
+                    
+                    results.append({
+                        "applicant_id": applicant.id,
+                        "applicant_name": f"{applicant.first_name} {applicant.last_name}",
+                        "programme": applicant.selected_programme_name or applicant.program,
+                        "eligible": is_eligible,
+                        "auto_eligible": is_auto_eligible,
+                        "score": data.get('score', 0),
+                        "subjects_count": data.get('subjects_count', 0),
+                        "credits_count": data.get('credits_count', 0)
+                    })
+                else:
+                    results.append({
+                        "applicant_id": applicant.id,
+                        "applicant_name": f"{applicant.first_name} {applicant.last_name}",
+                        "error": check_result.get('message', 'Check failed')
+                    })
+            except Exception as e:
+                results.append({
+                    "applicant_id": applicant.id,
+                    "applicant_name": f"{applicant.first_name} {applicant.last_name}",
+                    "error": str(e)
+                })
+        
+        return {
+            "success": True,
+            "message": f"Batch eligibility check completed for {len(applicants)} applicants",
+            "results": results,
+            "summary": {
+                "total": len(applicants),
+                "eligible": eligible_count,
+                "ineligible": ineligible_count,
+                "auto_eligible": auto_eligible_count,
+                "successful": len([r for r in results if 'error' not in r])
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error in batch check: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.post("/eligibility/override/{applicant_id}", response={200: dict, 401: dict, 404: dict})
+@router.post("/eligibility/override/{applicant_id}/", response={200: dict, 401: dict, 404: dict})
+def override_eligibility(request, applicant_id: int, data: EligibilityOverrideSchema):
+    """Manually override eligibility decision (committee only)"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Applicant, EligibilityOverride, EligibilityLog, Notification
+        
+        try:
+            applicant = Applicant.objects.get(id=applicant_id)
+        except Applicant.DoesNotExist:
+            return {
+                "success": False,
+                "message": f"Applicant with ID {applicant_id} not found"
+            }
+        
+        # Get previous eligibility status
+        previous_check = check_applicant_eligibility(request, applicant_id)
+        previous_eligible = previous_check.get('data', {}).get('eligible', False) if previous_check.get('success') else False
+        
+        programme_id = applicant.selected_programme_id or 1
+        
+        # Create or update override
+        override, created = EligibilityOverride.objects.update_or_create(
+            applicant=applicant,
+            programme_id=programme_id,
+            defaults={
+                'eligible': data.eligible,
+                'reason': data.reason,
+                'notes': data.notes or '',
+                'performed_by': user.email,
+                'expires_at': None
+            }
+        )
+        
+        # Log the override
+        EligibilityLog.objects.create(
+            applicant=applicant,
+            programme_id=programme_id,
+            programme_name=applicant.selected_programme_name or 'Unknown',
+            action='manual_override',
+            previous_status=previous_eligible,
+            new_status=data.eligible,
+            reason=data.reason,
+            performed_by=user.email,
+            eligibility_score=100 if data.eligible else 0
+        )
+        
+        # Create notification for the applicant
+        status_text = "approved" if data.eligible else "not approved"
+        Notification.objects.create(
+            user=applicant.user,
+            title="Eligibility Status Updated",
+            message=f"Your eligibility for {applicant.selected_programme_name or 'your programme'} has been manually {status_text}. Reason: {data.reason[:100]}",
+            notification_type="eligibility",
+            is_read=False,
+            link="/application/status"
+        )
+        
+        return {
+            "success": True,
+            "message": f"Eligibility overridden to {'Eligible' if data.eligible else 'Not Eligible'}",
+            "data": {
+                "eligible": data.eligible,
+                "reason": data.reason,
+                "performed_by": user.email,
+                "created_at": override.created_at.isoformat()
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error overriding eligibility: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+@router.get("/eligibility/history/{applicant_id}", response={200: dict, 401: dict, 404: dict})
+@router.get("/eligibility/history/{applicant_id}/", response={200: dict, 401: dict, 404: dict})
+def get_eligibility_history(request, applicant_id: int):
+    """Get eligibility check history for an applicant"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import EligibilityLog
+        
+        logs = EligibilityLog.objects.filter(applicant_id=applicant_id).order_by('-performed_at')
+        
+        data = []
+        for log in logs:
+            data.append({
+                "id": log.id,
+                "action": log.action,
+                "previous_status": log.previous_status,
+                "new_status": log.new_status,
+                "reason": log.reason,
+                "performed_by": log.performed_by,
+                "performed_at": log.performed_at.isoformat(),
+                "eligibility_score": log.eligibility_score
+            })
+        
+        return {
+            "success": True,
+            "message": f"Found {len(data)} eligibility history records",
+            "data": data,
+            "count": len(data)
+        }
+        
+    except Exception as e:
+        print(f"Error fetching eligibility history: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
+# ==================== DELETE NOTIFICATION ENDPOINT ====================
+
+@router.delete("/notifications/{notification_id}", response={200: dict, 401: dict, 404: dict})
+@router.delete("/notifications/{notification_id}/", response={200: dict, 401: dict, 404: dict})
+def delete_notification(request, notification_id: int):
+    """Delete a specific notification"""
+    try:
+        user = get_user_from_token(request)
+        
+        from .models import Notification
+        
+        try:
+            notification = Notification.objects.get(id=notification_id, user=user)
+        except Notification.DoesNotExist:
+            return {
+                "success": False,
+                "message": "Notification not found"
+            }
+        
+        notification.delete()
+        
+        return {
+            "success": True,
+            "message": "Notification deleted successfully"
+        }
+        
+    except HttpError:
+        raise
+    except Exception as e:
+        print(f"Error deleting notification: {str(e)}")
+        return {
+            "success": False,
+            "message": str(e)
+        }
 
 # ==================== JWT HELPER FUNCTIONS ====================
 api.add_router("/ml", ml_router)

@@ -60,7 +60,7 @@ class DepositSlipRecognizer:
             ]
         }
         
-        # Enhanced regex patterns for extraction - specifically for NBS deposit slip
+        # Enhanced regex patterns for extraction - FIXED: removed all \K escapes
         self.patterns = {
             'reference': [
                 r'(?:REF|REFERENCE|TRANSACTION REF|TXN REF|Deposit Reference|Reference No)[:\s]*([A-Z0-9\-]{6,25})',
@@ -77,7 +77,7 @@ class DepositSlipRecognizer:
                 r'([0-9,]+)\s*\.\s*00',
                 r'Total[:\s]*([0-9,]+)',
                 r'K\d+\s+(\d+)\s+(\d+)\s+(\d+)',  # For denomination table like K5000 | 2 00 0 00
-                r'TOTAL[:\s]*\K([0-9\s]+)',  # Total field
+                r'TOTAL[:\s]*([0-9\s]+)',  # FIXED: removed \K
             ],
             'account': [
                 r'(?:ACCOUNT|A/C|ACCOUNT NO|Account Number)[:\s#]*([0-9]{8,16})',
@@ -181,17 +181,21 @@ class DepositSlipRecognizer:
         return '\n'.join(combined_lines)
     
     def extract_fields(self, text: str) -> Dict:
-        """Extract fields using regex"""
+        """Extract fields using regex - FIXED: properly handles all patterns"""
         extracted = {}
         
         for field, patterns in self.patterns.items():
             for pattern in patterns:
-                matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
-                if matches:
-                    value = matches[0].strip() if isinstance(matches[0], str) else str(matches[0])
-                    if value and len(value) > 1:
-                        extracted[field] = value
-                        break
+                try:
+                    matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+                    if matches:
+                        value = matches[0].strip() if isinstance(matches[0], str) else str(matches[0])
+                        if value and len(value) > 1:
+                            extracted[field] = value
+                            break
+                except re.error as e:
+                    logger.warning(f"Regex error for pattern {pattern}: {e}")
+                    continue
         
         return extracted
     
@@ -200,16 +204,19 @@ class DepositSlipRecognizer:
         total = 0.0
         
         # Look for denomination pattern
-        matches = self.denomination_pattern.findall(text)
-        for match in matches:
-            denomination = int(match[0])
-            # Parse the quantity (handles formats like "2 00 0 00" for 2000)
-            quantity_str = ''.join(match[1:]).strip()
-            try:
-                quantity = int(quantity_str)
-                total += denomination * quantity
-            except ValueError:
-                continue
+        try:
+            matches = self.denomination_pattern.findall(text)
+            for match in matches:
+                denomination = int(match[0])
+                # Parse the quantity (handles formats like "2 00 0 00" for 2000)
+                quantity_str = ''.join(match[1:]).strip()
+                try:
+                    quantity = int(quantity_str)
+                    total += denomination * quantity
+                except ValueError:
+                    continue
+        except Exception as e:
+            logger.warning(f"Error extracting from denominations: {e}")
         
         # Look for Total field
         total_patterns = [
@@ -219,14 +226,17 @@ class DepositSlipRecognizer:
         ]
         
         for pattern in total_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                total_str = match.group(1).replace(' ', '').replace(',', '')
-                try:
-                    total = float(total_str)
-                    break
-                except:
-                    continue
+            try:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    total_str = match.group(1).replace(' ', '').replace(',', '')
+                    try:
+                        total = float(total_str)
+                        break
+                    except:
+                        continue
+            except re.error:
+                continue
         
         return total if total > 0 else None
     
@@ -282,7 +292,7 @@ class DepositSlipRecognizer:
             score += 1
             total += 1
         
-        return min(score / total, 1.0)
+        return min(score / total, 1.0) if total > 0 else 0.0
     
     def recognize(self, file) -> Dict[str, Any]:
         """Main recognition method with enhanced NBS deposit slip support"""
